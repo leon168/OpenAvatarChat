@@ -350,11 +350,17 @@ class HandlerSRTOutput(HandlerBase):
         context.session = session
         return session
 
+    _video_frame_logged = False  # 只记录第一帧的详细信息
+
     def _prepare_video_frame(self, video_frame: np.ndarray) -> Optional[bytes]:
         """预处理视频帧：squeeze、BGR->RGB、resize，返回 RGB bytes"""
         # 去除批次维度 (1, H, W, 3) -> (H, W, 3)
         if video_frame.ndim == 4 and video_frame.shape[0] == 1:
             video_frame = video_frame.squeeze(axis=0)
+
+        if not HandlerSRTOutput._video_frame_logged:
+            logger.info(f"SRT: Video frame original shape={video_frame.shape}, dtype={video_frame.dtype}")
+            HandlerSRTOutput._video_frame_logged = True
 
         # 确保格式正确 (uint8)
         if video_frame.dtype != np.uint8:
@@ -376,6 +382,8 @@ class HandlerSRTOutput(HandlerBase):
         if video_frame.shape[0] != target_height or video_frame.shape[1] != target_width:
             import cv2
             video_frame = cv2.resize(video_frame, (target_width, target_height))
+            if not HandlerSRTOutput._video_frame_logged:
+                logger.info(f"SRT: Resized to {video_frame.shape}")
 
         return video_frame.tobytes()
 
@@ -393,14 +401,20 @@ class HandlerSRTOutput(HandlerBase):
             # 在锁内获取 stdin 引用和更新计数
             with session.state_lock:
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                    logger.warning(f"SRT: ffmpeg 已退出, poll={session.ffmpeg_process.poll() if session.ffmpeg_process else 'N/A'}")
                     return False
                 stdin = session.ffmpeg_process.stdin
                 session.frame_count += 1
                 count = session.frame_count
 
+            if count <= 2:
+                logger.info(f"SRT: Writing video frame #{count}, {len(rgb_bytes)} bytes")
+
             # 锁外执行 I/O（避免阻塞其他操作）
             stdin.write(rgb_bytes)
 
+            if count == 1:
+                logger.info("SRT: First video frame written to ffmpeg stdin")
             if count % 25 == 0:
                 logger.info(f"SRT: Sent {count} video frames")
 
