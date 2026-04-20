@@ -62,19 +62,19 @@ class XilingMessage:
 # ============================================================================
 
 @dataclass
-class TextBody:
+class TextMessageBody:
     """TEXT 消息体 - 文本驱动数字人"""
     text: str               # 要播报的文本
     streamId: str           # 自定义流ID
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "text": self.text,
             "streamId": self.streamId
         })
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "TextBody":
+    def from_dict(cls, data: Dict[str, Any]) -> "TextMessageBody":
         return cls(
             text=data.get("text", ""),
             streamId=data.get("streamId", "")
@@ -82,21 +82,21 @@ class TextBody:
 
 
 @dataclass
-class StartBody:
+class StartMessageBody:
     """START 消息体 - 开始音频流驱动"""
     streamId: str           # 流ID
     event: Literal["START"] = "START"
     sampleRate: int = 16000  # 采样率，默认16k
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "streamId": self.streamId,
             "event": self.event,
             "sampleRate": self.sampleRate
         })
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "StartBody":
+    def from_dict(cls, data: Dict[str, Any]) -> "StartMessageBody":
         return cls(
             streamId=data.get("streamId", ""),
             event=data.get("event", "START"),
@@ -105,19 +105,19 @@ class StartBody:
 
 
 @dataclass
-class CompleteBody:
+class CompleteMessageBody:
     """COMPLETE 消息体 - 音频流发送完成"""
     streamId: str           # 流ID
     event: Literal["COMPLETE"] = "COMPLETE"
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "streamId": self.streamId,
             "event": self.event
         })
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "CompleteBody":
+    def from_dict(cls, data: Dict[str, Any]) -> "CompleteMessageBody":
         return cls(
             streamId=data.get("streamId", ""),
             event=data.get("event", "COMPLETE")
@@ -125,18 +125,18 @@ class CompleteBody:
 
 
 @dataclass
-class InterruptBody:
+class InterruptMessageBody:
     """INTERRUPT 消息体 - 打断播报"""
     streamId: Optional[str] = None  # 可选，要打断的流ID
-    
+
     def to_json(self) -> str:
         data = {}
         if self.streamId:
             data["streamId"] = self.streamId
         return json.dumps(data)
-    
+
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "InterruptBody":
+    def from_dict(cls, data: Dict[str, Any]) -> "InterruptMessageBody":
         return cls(streamId=data.get("streamId"))
 
 
@@ -145,11 +145,11 @@ class InterruptBody:
 # ============================================================================
 
 @dataclass
-class ReadyBody:
+class ReadyMessageBody:
     """READY 消息体 - 服务端就绪"""
     streamId: str           # 会话/流ID
     event: Literal["READY"] = "READY"
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "streamId": self.streamId,
@@ -162,7 +162,7 @@ class StartAckBody:
     """START 确认消息体"""
     streamId: str
     event: Literal["START"] = "START"
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "streamId": self.streamId,
@@ -175,7 +175,7 @@ class CompleteAckBody:
     """COMPLETE 确认消息体"""
     streamId: str
     event: Literal["COMPLETE"] = "COMPLETE"
-    
+
     def to_json(self) -> str:
         return json.dumps({
             "streamId": self.streamId,
@@ -184,11 +184,11 @@ class CompleteAckBody:
 
 
 @dataclass
-class InterruptedBody:
+class InterruptedMessageBody:
     """INTERRUPTED 消息体 - 已打断"""
     streamId: Optional[str]
     event: Literal["INTERRUPTED"] = "INTERRUPTED"
-    
+
     def to_json(self) -> str:
         data = {"event": self.event}
         if self.streamId:
@@ -197,12 +197,12 @@ class InterruptedBody:
 
 
 @dataclass
-class ErrorBody:
+class ErrorMessageBody:
     """ERROR 消息体"""
     event: Literal["ERROR"] = "ERROR"
     message: str = ""         # 错误信息
     code: Optional[int] = None  # 错误码
-    
+
     def to_json(self) -> str:
         data = {
             "event": self.event,
@@ -219,31 +219,31 @@ class ErrorBody:
 
 def create_text_message(msg_id: int, text: str, stream_id: str) -> XilingMessage:
     """创建文本驱动消息"""
-    body = TextBody(text=text, streamId=stream_id)
+    body = TextMessageBody(text=text, streamId=stream_id)
     return XilingMessage(id=msg_id, type=MessageType.TEXT.value, body=body.to_json())
 
 
 def create_start_message(msg_id: int, stream_id: str, sample_rate: int = 16000) -> XilingMessage:
     """创建开始音频流消息"""
-    body = StartBody(streamId=stream_id, sampleRate=sample_rate)
+    body = StartMessageBody(streamId=stream_id, sampleRate=sample_rate)
     return XilingMessage(id=msg_id, type=MessageType.START.value, body=body.to_json())
 
 
 def create_complete_message(msg_id: int, stream_id: str) -> XilingMessage:
     """创建音频流完成消息"""
-    body = CompleteBody(streamId=stream_id)
+    body = CompleteMessageBody(streamId=stream_id)
     return XilingMessage(id=msg_id, type=MessageType.COMPLETE.value, body=body.to_json())
 
 
 def create_interrupt_message(msg_id: int, stream_id: Optional[str] = None) -> XilingMessage:
     """创建打断消息"""
-    body = InterruptBody(streamId=stream_id)
+    body = InterruptMessageBody(streamId=stream_id)
     return XilingMessage(id=msg_id, type=MessageType.INTERRUPT.value, body=body.to_json())
 
 
 def create_ready_message(msg_id: int, stream_id: str) -> XilingMessage:
     """创建就绪消息（下行）"""
-    body = ReadyBody(streamId=stream_id)
+    body = ReadyMessageBody(streamId=stream_id)
     return XilingMessage(id=msg_id, type=MessageType.READY.value, body=body.to_json())
 
 
@@ -261,11 +261,11 @@ def create_complete_ack_message(msg_id: int, stream_id: str) -> XilingMessage:
 
 def create_interrupted_message(msg_id: int, stream_id: Optional[str] = None) -> XilingMessage:
     """创建已打断消息（下行）"""
-    body = InterruptedBody(streamId=stream_id)
+    body = InterruptedMessageBody(streamId=stream_id)
     return XilingMessage(id=msg_id, type=MessageType.INTERRUPTED.value, body=body.to_json())
 
 
 def create_error_message(msg_id: int, message: str, code: Optional[int] = None) -> XilingMessage:
     """创建错误消息（下行）"""
-    body = ErrorBody(message=message, code=code)
+    body = ErrorMessageBody(message=message, code=code)
     return XilingMessage(id=msg_id, type=MessageType.ERROR.value, body=body.to_json())
