@@ -19,7 +19,7 @@ import subprocess
 import threading
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Dict, Optional, cast, Any
+from typing import Dict, Optional, Set, cast, Any
 from pathlib import Path
 
 from loguru import logger
@@ -49,7 +49,7 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     video_height: int = Field(default=512, description="视频高度")
     fps: int = Field(default=25, description="视频帧率")
     video_bitrate: int = Field(default=2000, description="视频码率(kbps)")
-    audio_sample_rate: int = Field(default=16000, description="音频输入采样率")
+    audio_sample_rate: int = Field(default=24000, description="音频输入采样率")
     audio_bitrate: int = Field(default=128, description="音频码率(kbps)")
     preset: str = Field(default="fast", description="x264 预设 (ultrafast, superfast, veryfast, faster, fast, medium)")
     tune: str = Field(default="zerolatency", description="x264 tune 参数")
@@ -60,18 +60,16 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
 
 @dataclass
 class SRTSession:
-    """SRT 会话状态"""
-    input_stream_id: ChatStreamIdentity
-    output_stream_key: Optional[StreamKey] = None
+    """SRT 会话状态 - 管理单个 ffmpeg 进程，接收音视频两种流"""
     ffmpeg_process: Optional[subprocess.Popen] = None
-    video_buffer: bytearray = field(default_factory=bytearray)
-    audio_buffer: bytearray = field(default_factory=bytearray)
     frame_count: int = 0
     audio_sample_count: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
-    
+    # 跟踪当前活跃的流
+    active_streams: Set[str] = field(default_factory=set)
+
     def reset(self):
-        """重置会话"""
+        """重置会话，关闭 ffmpeg 进程"""
         with self.lock:
             if self.ffmpeg_process is not None:
                 try:
@@ -83,48 +81,49 @@ class SRTSession:
                     except Exception:
                         pass
                 self.ffmpeg_process = None
-            self.video_buffer.clear()
-            self.audio_buffer.clear()
             self.frame_count = 0
             self.audio_sample_count = 0
+            self.active_streams.clear()
+
+    @property
+    def is_running(self) -> bool:
+        return self.ffmpeg_process is not None and self.ffmpeg_process.poll() is None
 
 
 class SRTOutputContext(HandlerContext):
     """SRT 输出 Handler 上下文"""
-    
+
     def __init__(self, session_id: str):
         super().__init__(session_id)
         self.config: Optional[SRTOutputConfig] = None
-        self.sessions: Dict[StreamKey, SRTSession] = {}
-        self.current_session: Optional[SRTSession] = None
-        
-    def _create_session(self, input_stream: ChatStreamIdentity) -> SRTSession:
-        return SRTSession(input_stream_id=input_stream)
+        self.session: Optional[SRTSession] = None
 
 
 class HandlerSRTOutput(HandlerBase):
     """
     SRT 推流输出 Handler
-    
-    接收 Avatar 的视频帧和音频数据，通过 ffmpeg 编码并推流到 SRS
+
+    接收 Avatar 的视频帧和音频数据，通过 ffmpeg 编码并推流到 SRS。
+    音视频来自不同的流（AVATAR_AUDIO 和 AVATAR_VIDEO），
+    但共享同一个 ffmpeg 进程。
     """
-    
+
     def __init__(self):
         super().__init__()
         self.config: Optional[SRTOutputConfig] = None
-        
+
     def get_handler_info(self) -> HandlerBaseInfo:
         return HandlerBaseInfo(
             config_model=SRTOutputConfig,
         )
-    
+
     def load(self, engine_config: ChatEngineConfigModel, handler_config: Optional[BaseModel] = None):
         self.config = cast(SRTOutputConfig, handler_config or SRTOutputConfig())
-        
+
         # 优先使用环境变量
         if self.config.srt_url_env in os.environ:
             self.config.srt_url = os.getenv(self.config.srt_url_env, self.config.srt_url)
-        
+
         # 检查 ffmpeg
         try:
             result = subprocess.run(
@@ -139,11 +138,11 @@ class HandlerSRTOutput(HandlerBase):
                 logger.info(f"ffmpeg SRT 支持已确认: {self.config.ffmpeg_path}")
         except Exception as e:
             logger.error(f"检查 ffmpeg 失败: {e}")
-        
+
         logger.info(f"SRT Output Handler loaded, url={self.config.srt_url}, "
                    f"latency={self.config.latency_ms}ms, "
                    f"video={self.config.video_width}x{self.config.video_height}@{self.config.fps}fps")
-    
+
     def _start_ffmpeg(self, config: SRTOutputConfig) -> subprocess.Popen:
         """启动 ffmpeg 进程进行 SRT 推流"""
         # 构建 SRT URL (添加 latency 参数)
@@ -151,7 +150,7 @@ class HandlerSRTOutput(HandlerBase):
         if "latency=" not in srt_url:
             separator = "&" if "?" in srt_url.split("#")[-1] else "&"
             srt_url = f"{srt_url}{separator}latency={config.latency_ms * 1000}"  # 微秒
-        
+
         command = [
             config.ffmpeg_path,
             "-y",  # 覆盖输出
@@ -189,9 +188,9 @@ class HandlerSRTOutput(HandlerBase):
             "-flush_packets", "1",  # 立即刷新包
             srt_url
         ]
-        
+
         logger.info(f"Starting ffmpeg: {' '.join(command)}")
-        
+
         process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -199,7 +198,7 @@ class HandlerSRTOutput(HandlerBase):
             stderr=subprocess.PIPE,
             bufsize=0  # 无缓冲
         )
-        
+
         # 启动 stderr 读取线程 (用于错误日志)
         def read_stderr():
             while process.poll() is None:
@@ -209,20 +208,20 @@ class HandlerSRTOutput(HandlerBase):
                         logger.warning(f"ffmpeg: {line.decode('utf-8', errors='ignore').strip()}")
                 except Exception:
                     break
-        
+
         threading.Thread(target=read_stderr, daemon=True).start()
-        
+
         return process
-    
-    def create_context(self, session_context: SessionContext, 
+
+    def create_context(self, session_context: SessionContext,
                        handler_config: Optional[BaseModel] = None) -> HandlerContext:
         context = SRTOutputContext(session_context.session_info.session_id)
         context.config = cast(SRTOutputConfig, handler_config or self.config)
         return context
-    
+
     def start_context(self, session_context: SessionContext, handler_context: HandlerContext):
         pass
-    
+
     def get_handler_detail(self, session_context: SessionContext,
                            context: HandlerContext) -> HandlerDetail:
         inputs = [
@@ -230,7 +229,7 @@ class HandlerSRTOutput(HandlerBase):
             HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
         ]
         outputs = []  # 输出到外部，不产生内部输出
-        
+
         return HandlerDetail(
             inputs=inputs,
             outputs=outputs,
@@ -238,149 +237,189 @@ class HandlerSRTOutput(HandlerBase):
                 SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, None)
             ]
         )
-    
-    def _write_frame_to_ffmpeg(self, session: SRTSession, video_frame: np.ndarray, audio_data: np.ndarray):
-        """写入音视频帧到 ffmpeg"""
-        if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+
+    def _ensure_session(self, context: SRTOutputContext) -> SRTSession:
+        """确保有一个活跃的 ffmpeg 会话，如果没有则创建"""
+        if context.session is not None and context.session.is_running:
+            return context.session
+
+        # 创建新会话
+        session = SRTSession()
+        try:
+            session.ffmpeg_process = self._start_ffmpeg(context.config)
+            logger.info(f"SRT Output: ffmpeg 已启动，推流到 {context.config.srt_url}")
+        except Exception as e:
+            logger.error(f"SRT Output: 启动 ffmpeg 失败: {e}")
+            return None
+
+        context.session = session
+        return session
+
+    def _write_video(self, session: SRTSession, video_frame: np.ndarray):
+        """写入视频帧到 ffmpeg"""
+        if not session.is_running:
             return False
-        
+
+        if video_frame is None:
+            logger.debug("SRT: video frame is None, skipping")
+            return True
+
+        if video_frame.size == 0:
+            logger.warning(f"SRT: video frame size is 0, shape: {video_frame.shape}")
+            return True
+
         try:
             with session.lock:
-                # 写入视频帧 (RGB -> bytes)
-                if video_frame is not None and video_frame.size > 0:
-                    logger.debug(f"Video frame: shape={video_frame.shape}, dtype={video_frame.dtype}, size={video_frame.size}")
+                if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                    return False
 
-                    # 确保格式正确
-                    if video_frame.dtype != np.uint8:
-                        video_frame = (video_frame * 255).clip(0, 255).astype(np.uint8)
+                # 去除批次维度 (1, H, W, 3) -> (H, W, 3)
+                if video_frame.ndim == 4 and video_frame.shape[0] == 1:
+                    video_frame = video_frame.squeeze(axis=0)
 
-                    # 调整尺寸
-                    target_width = self.config.video_width if self.config.video_width > 0 else 512
-                    target_height = self.config.video_height if self.config.video_height > 0 else 512
+                # 确保格式正确 (uint8)
+                if video_frame.dtype != np.uint8:
+                    video_frame = (video_frame * 255).clip(0, 255).astype(np.uint8)
 
-                    logger.debug(f"Target size: {target_width}x{target_height}, current: {video_frame.shape[:2]}")
+                # 确保是 3 通道
+                if video_frame.ndim == 2:
+                    video_frame = np.stack([video_frame] * 3, axis=-1)
+                elif video_frame.shape[2] == 4:
+                    video_frame = video_frame[:, :, :3]
 
-                    if video_frame.shape[:2] != (target_height, target_width):
-                        import cv2
-                        video_frame = cv2.resize(video_frame, (target_width, target_height))
-                        logger.debug(f"Resized to: {video_frame.shape}")
+                # BGR -> RGB (LiteAvatar 输出 BGR, ffmpeg 需要 rgb24)
+                video_frame = video_frame[:, :, ::-1]
 
-                    # 转换为 RGB bytes
-                    rgb_bytes = video_frame.tobytes()
-                    session.ffmpeg_process.stdin.write(rgb_bytes)
-                    session.frame_count += 1
+                # 调整尺寸
+                target_width = self.config.video_width if self.config.video_width > 0 else 512
+                target_height = self.config.video_height if self.config.video_height > 0 else 512
 
-                    if session.frame_count % 25 == 0:
-                        logger.info(f"Sent {session.frame_count} frames to ffmpeg")
-                elif video_frame is None:
-                    logger.warning("Video frame is None")
-                else:
-                    logger.warning(f"Video frame size is 0, shape: {video_frame.shape}")
-                
-                # 写入音频 (float32 -> bytes)
-                if audio_data is not None and audio_data.size > 0:
-                    # 转换为 float32
-                    if audio_data.dtype != np.float32:
-                        audio_data = audio_data.astype(np.float32)
-                    
-                    # 确保是 1D 数组
-                    audio_data = audio_data.flatten()
-                    
-                    session.ffmpeg_process.stdin.write(audio_data.tobytes())
-                    session.audio_sample_count += len(audio_data)
-                
+                if video_frame.shape[0] != target_height or video_frame.shape[1] != target_width:
+                    import cv2
+                    video_frame = cv2.resize(video_frame, (target_width, target_height))
+
+                # 转换为 RGB bytes 并写入
+                rgb_bytes = video_frame.tobytes()
+                expected_size = target_width * target_height * 3
+                if len(rgb_bytes) != expected_size:
+                    logger.warning(f"SRT: video frame size mismatch, got {len(rgb_bytes)}, expected {expected_size}")
+                    return False
+
+                session.ffmpeg_process.stdin.write(rgb_bytes)
+                session.frame_count += 1
+
+                if session.frame_count % 25 == 0:
+                    logger.info(f"SRT: Sent {session.frame_count} frames to ffmpeg")
+
             return True
-            
+
         except BrokenPipeError:
-            logger.error("ffmpeg stdin pipe broken")
+            logger.error("SRT: ffmpeg stdin pipe broken (video)")
             return False
         except Exception as e:
-            logger.error(f"写入 ffmpeg 失败: {e}")
+            logger.error(f"SRT: 写入视频帧失败: {e}")
             return False
-    
+
+    def _write_audio(self, session: SRTSession, audio_data: np.ndarray):
+        """写入音频数据到 ffmpeg
+
+        LiteAvatar 输出 int16 PCM, shape (1, N), 24000Hz。
+        ffmpeg 期望 f32le 格式，值域 [-1.0, 1.0]。
+        """
+        if not session.is_running:
+            return False
+
+        if audio_data is None or audio_data.size == 0:
+            return True
+
+        try:
+            with session.lock:
+                if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                    return False
+
+                # 展平为 1D 数组 (处理 (1, N) shape)
+                audio_data = audio_data.flatten()
+
+                # int16 -> 归一化 float32 [-1.0, 1.0]
+                if audio_data.dtype == np.int16:
+                    audio_data = audio_data.astype(np.float32) / 32768.0
+                elif audio_data.dtype != np.float32:
+                    audio_data = audio_data.astype(np.float32)
+                    # 如果值域不在 [-1, 1]，进行归一化
+                    max_val = np.abs(audio_data).max()
+                    if max_val > 1.0:
+                        audio_data = audio_data / max_val
+
+                session.ffmpeg_process.stdin.write(audio_data.tobytes())
+                session.audio_sample_count += len(audio_data)
+
+            return True
+
+        except BrokenPipeError:
+            logger.error("SRT: ffmpeg stdin pipe broken (audio)")
+            return False
+        except Exception as e:
+            logger.error(f"SRT: 写入音频数据失败: {e}")
+            return False
+
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
-        """处理输入数据"""
+        """处理输入数据 - 音视频流共享同一个 ffmpeg 进程"""
         context = cast(SRTOutputContext, context)
-        
+
         input_stream = inputs.stream_id
-        input_stream_key = input_stream.key
-        
-        # 获取或创建会话
-        session = context.sessions.get(input_stream_key)
+        stream_key_str = input_stream.key if input_stream else "unknown"
+
+        # 确保有活跃的 ffmpeg 会话
+        session = self._ensure_session(context)
         if session is None:
-            # 新的输入流，取消旧的
-            for old_key, old_session in list(context.sessions.items()):
-                logger.info(f"SRT Output: 取消旧会话 {old_key}")
-                old_session.reset()
-            context.sessions.clear()
-            
-            # 创建新会话
-            session = context._create_session(input_stream)
-            context.sessions[input_stream_key] = session
-            context.current_session = session
-            
-            # 启动 ffmpeg
-            try:
-                session.ffmpeg_process = self._start_ffmpeg(context.config)
-                logger.info(f"SRT Output: ffmpeg 已启动，推流到 {context.config.srt_url}")
-            except Exception as e:
-                logger.error(f"SRT Output: 启动 ffmpeg 失败: {e}")
-                context.sessions.pop(input_stream_key, None)
-                return
-        
-        # 处理数据
+            logger.error("SRT Output: 无法创建 ffmpeg 会话")
+            return
+
+        # 记录活跃流
+        stream_id_str = f"{inputs.type.value}:{stream_key_str}"
+        if stream_id_str not in session.active_streams:
+            session.active_streams.add(stream_id_str)
+            logger.info(f"SRT Output: 新流加入 {stream_id_str}, 活跃流: {session.active_streams}")
+
+        # 根据数据类型分发处理
         if inputs.type == ChatDataType.AVATAR_VIDEO:
-            # 视频帧
             video_frame = inputs.data.get_main_data()
-            if video_frame is not None:
-                self._write_frame_to_ffmpeg(session, video_frame, None)
-                
+            self._write_video(session, video_frame)
+
         elif inputs.type == ChatDataType.AVATAR_AUDIO:
-            # 音频数据
             audio_data = inputs.data.get_main_data()
-            is_last = inputs.is_last_data
-            
-            if audio_data is not None:
-                self._write_frame_to_ffmpeg(session, None, audio_data)
-            
-            # 如果是最后一帧，关闭会话
-            if is_last:
-                logger.info(f"SRT Output: 流结束，关闭会话 {input_stream_key}")
-                session.reset()
-                context.sessions.pop(input_stream_key, None)
-                if context.current_session == session:
-                    context.current_session = None
-    
+            self._write_audio(session, audio_data)
+
+            # 如果是最后一帧音频，检查是否需要关闭会话
+            if inputs.is_last_data:
+                session.active_streams.discard(stream_id_str)
+                logger.info(f"SRT Output: 音频流结束 {stream_id_str}, 剩余活跃流: {session.active_streams}")
+
+                # 如果所有流都结束了，重置会话
+                if not session.active_streams:
+                    logger.info("SRT Output: 所有流结束，关闭 ffmpeg 会话")
+                    session.reset()
+                    context.session = None
+
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
         """处理打断信号"""
         context = cast(SRTOutputContext, context)
-        
-        if signal.type == ChatSignalType.STREAM_CANCEL and signal.related_stream:
-            stream_key = signal.related_stream.key
-            if stream_key is None:
-                return
-            
-            # 检查输入流
-            session = context.sessions.pop(stream_key, None)
-            if session:
-                logger.info(f"SRT Output: 取消会话 {stream_key}")
-                session.reset()
-                return
-    
+
+        if signal.type == ChatSignalType.STREAM_CANCEL:
+            logger.info(f"SRT Output: 收到取消信号，关闭 ffmpeg 会话")
+            if context.session is not None:
+                context.session.reset()
+                context.session = None
+
     def destroy_context(self, context: HandlerContext):
         """销毁上下文"""
         context = cast(SRTOutputContext, context)
         logger.info("SRT Output: 销毁上下文")
-        
-        for session in context.sessions.values():
+
+        if context.session is not None:
             try:
-                session.reset()
+                context.session.reset()
             except Exception as e:
                 logger.warning(f"重置会话失败: {e}")
-        
-        context.sessions.clear()
-
-
-# 导入 os 用于环境变量检查
-import os
+            context.session = None

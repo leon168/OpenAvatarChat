@@ -67,6 +67,7 @@ default:
         video_height: 512
         fps: 25
         video_bitrate: 2000
+        audio_sample_rate: 24000  # LiteAvatar 输出 24kHz
         audio_bitrate: 128
         preset: fast
         tune: zerolatency
