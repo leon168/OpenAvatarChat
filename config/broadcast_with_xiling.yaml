@@ -13,7 +13,18 @@ default:
       - "src/handlers"
     handler_configs:
 
-      # === 希灵 WebSocket 客户端 (百度数字人兼容接口) ===
+      # === WebRTC 客户端 (输出视频流到浏览器/播放器) ===
+      RtcClient:
+        enabled: True
+        module: client/rtc_client/client_handler_rtc
+        connection_ttl: 3600
+
+      # === 打断处理器 ===
+      InterruptHandler:
+        enabled: True
+        module: logic/interrupt/interrupt_handler
+
+      # === 希灵 WebSocket 客户端 (接收外部文本输入，百度数字人兼容接口) ===
       XilingWebSocket:
         enabled: True
         module: client/xiling_ws/xiling_ws_handler
@@ -44,8 +55,7 @@ default:
         enabled: True
         module: avatar/liteavatar/avatar_handler_liteavatar
         avatar_name: 20250408/sample_data
-        fps: 25  # 与 TTS 输出对齐
+        fps: 25
         debug: false
         enable_fast_mode: false
         use_gpu: true
-
