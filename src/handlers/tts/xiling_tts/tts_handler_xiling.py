@@ -27,8 +27,8 @@ from chat_engine.contexts.session_context import SessionContext
 from chat_engine.data_models.chat_data.chat_data_model import ChatData
 from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel
-from chat_engine.data_models.chat_signal import ChatSignal
-from chat_engine.data_models.chat_signal_type import ChatSignalType, SignalFilterRule
+from chat_engine.data_models.chat_signal import ChatSignal, SignalFilterRule
+from chat_engine.data_models.chat_signal_type import ChatSignalType
 from chat_engine.data_models.chat_stream import StreamKey, ChatStreamIdentity
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
