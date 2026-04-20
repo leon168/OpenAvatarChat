@@ -140,12 +140,23 @@ class XilingWsHandler(ClientHandlerBase):
     
     def on_setup_app(self, app, ui, parent_block):
         """注册 WebSocket 路由"""
+
         @app.websocket(self.config.path)
         async def xiling_ws_endpoint(websocket: WebSocket):
             await self._handle_connection(websocket)
-        
-        # 启动清理任务
-        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+        # 使用 FastAPI 启动事件来启动清理任务
+        @app.on_event("startup")
+        async def startup_event():
+            self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            logger.info(f"Xiling cleanup task started")
+
+        @app.on_event("shutdown")
+        async def shutdown_event():
+            if self._cleanup_task and not self._cleanup_task.done():
+                self._cleanup_task.cancel()
+                logger.info(f"Xiling cleanup task cancelled")
+
         logger.info(f"Xiling WebSocket endpoint registered at {self.config.path}")
     
     async def _cleanup_loop(self):
