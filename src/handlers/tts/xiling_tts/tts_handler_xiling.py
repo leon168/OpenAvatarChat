@@ -236,7 +236,7 @@ class HandlerTTSXiling(HandlerBase):
         if not text:
             return ""
         # 移除 SSML 标签
-        text = re.sub(r""<\|.*?\|>", "", text)
+        text = re.sub(r'<\|.*?\|>', "", text)
         # 限制长度（百度限制 1000 字）
         if len(text) > 1000:
             text = text[:1000]
