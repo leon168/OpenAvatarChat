@@ -20,8 +20,8 @@ def import_class(module_name: str, base_class: type, search_paths: List[str]):
     try:
         logger.info(f"Try to load {module_import_path}")
         module = importlib.import_module(module_import_path)
-    except Exception:
-        logger.error(f"Failed to import module {module_name}")
+    except Exception as e:
+        logger.error(f"Failed to import module {module_name}: {type(e).__name__}: {e}")
         raise
     result_class = None
     for name, obj in inspect.getmembers(module):
