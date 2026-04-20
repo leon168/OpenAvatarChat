@@ -23,6 +23,7 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, cast
@@ -274,8 +275,28 @@ class HandlerSRTOutput(HandlerBase):
 
         threading.Thread(target=open_audio_fifo, daemon=True).start()
 
-        # 等待 FIFO 打开 (最多 10 秒)
-        audio_fd_ready.wait(timeout=10)
+        # 等待 FIFO 打开，同时检查 ffmpeg 进程状态
+        # 如果 ffmpeg 在等待期间崩溃，不需要继续等待
+        start_time = time.time()
+        timeout = 10
+        while not audio_fd_ready.is_set():
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                break
+            # 检查 ffmpeg 是否已退出
+            if process.poll() is not None:
+                # ffmpeg 已退出，取消 FIFO 等待
+                retcode = process.poll()
+                logger.error(f"SRT: ffmpeg exited prematurely with code {retcode}")
+                # 尝试读取 stderr 中的错误信息
+                try:
+                    stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
+                    if stderr_output:
+                        logger.error(f"SRT: ffmpeg stderr: {stderr_output[:500]}")
+                except Exception:
+                    pass
+                break
+            audio_fd_ready.wait(timeout=0.5)
 
         if audio_fd_error[0] is not None:
             process.kill()
@@ -284,6 +305,9 @@ class HandlerSRTOutput(HandlerBase):
         audio_fd = audio_fd_result[0]
         if audio_fd is None:
             process.kill()
+            # 提供更具体的错误信息
+            if process.poll() is not None:
+                raise RuntimeError(f"ffmpeg 启动后立即退出 (code={process.poll()})，无法打开音频 FIFO")
             raise RuntimeError("打开音频 FIFO 超时")
 
         session = SRTSession()

@@ -52,6 +52,7 @@ class XilingWsConfig(HandlerBaseConfigModel, BaseModel):
     connection_ttl: int = Field(default=3600, description="连接最长存活时间(秒)")
     heartbeat_interval: float = Field(default=30.0, description="心跳检测间隔(秒)")
     enable_ping_pong: bool = Field(default=True, description="启用 Ping/Pong 机制")
+    persist_session: bool = Field(default=True, description="客户端断连后是否保持 Session（直播场景需要）")
 
 
 @dataclass
@@ -259,11 +260,19 @@ class XilingWsHandler(ClientHandlerBase):
                 # 接收消息
                 message = await connection.websocket.receive()
 
+                msg_type = message.get("type", "")
+
+                # 处理断开连接消息
+                if msg_type == "websocket.disconnect":
+                    logger.info(f"Connection {connection.connection_id} received disconnect message")
+                    connection.quit.set()
+                    break
+
                 if "text" in message:
                     await self._handle_text_message(connection, message["text"])
                 elif "bytes" in message:
                     await self._handle_binary_message(connection, message["bytes"])
-                elif "type" in message and message["type"] == "websocket.ping":
+                elif msg_type == "websocket.ping":
                     # 处理 Ping 帧
                     await self._handle_ping(connection, message.get("bytes", b""))
 
@@ -478,16 +487,20 @@ class XilingWsHandler(ClientHandlerBase):
         connection = self.active_connections.pop(connection_id, None)
         if connection is None:
             return
-        
+
         logger.info(f"Closing connection: {connection_id}")
-        
+
         # 停止会话
         if connection.session_delegate:
             try:
-                self.handler_delegate.stop_session(connection.live_room)
+                if self.config.persist_session:
+                    # 直播场景：客户端断连不销毁 session，让数据流继续完成
+                    logger.info(f"Session {connection.live_room} persisting after client disconnect")
+                else:
+                    self.handler_delegate.stop_session(connection.live_room)
             except Exception as e:
                 logger.error(f"Stop session error: {e}")
-        
+
         # 关闭 WebSocket
         try:
             connection.quit.set()
