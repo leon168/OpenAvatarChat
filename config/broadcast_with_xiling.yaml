@@ -1,0 +1,51 @@
+default:
+  logger:
+    log_level: "INFO"
+  service:
+    host: "0.0.0.0"
+    port: 8282
+    cert_file: "ssl_certs/localhost.crt"
+    cert_key: "ssl_certs/localhost.key"
+  chat_engine:
+    model_root: "models"
+    concurrent_limit: 2
+    handler_search_path:
+      - "src/handlers"
+    handler_configs:
+
+      # === 希灵 WebSocket 客户端 (百度数字人兼容接口) ===
+      XilingWebSocket:
+        enabled: True
+        module: client/xiling_ws/xiling_ws_handler
+        path: "/ws/xiling"
+        sample_rate: 16000
+        connection_ttl: 3600
+
+      # === 希灵 TTS (百度流式语音合成) ===
+      XilingTTS:
+        enabled: True
+        module: tts/xiling_tts/tts_handler_xiling
+        auth_type: "api_key"  # 选项: api_key, access_token
+        # 两种认证方式，选择一种：
+        # 1. api_key 认证: 提供 API Key
+        # 2. access_token 认证：提供 API Key 和 Secret Key
+        api_key: ""  # 百度智能云 API Key，或设置环境变量 XILING_TTS_API_KEY
+        secret_key: ""  # 百度智能云 Secret Key，或设置环境变量 XILING_TTS_SECRET_KEY
+        access_token: ""  # 百度智能云访问令牌，或设置环境变量 XILING_TTS_ACCESS_TOKEN
+        per: "5118"  # 发音人 ID，默认度小娇
+        sample_rate: 16000  # 百度 TTS 输出 16kHz
+        spd: 5  # 语速，0-15，默认5
+        pit: 5  # 音调，0-15，默认5
+        vol: 5  # 音量，0-15，默认5
+        aue: 3  # 音频编码格式，默认 3=mp3-16k/24k
+
+      # === 数字人渲染 ===
+      LiteAvatar:
+        enabled: True
+        module: avatar/liteavatar/avatar_handler_liteavatar
+        avatar_name: 20250408/sample_data
+        fps: 25  # 与 TTS 输出对齐
+        debug: false
+        enable_fast_mode: false
+        use_gpu: true
+

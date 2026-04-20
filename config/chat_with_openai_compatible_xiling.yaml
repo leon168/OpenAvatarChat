@@ -1,0 +1,72 @@
+default:
+  logger:
+    log_level: "INFO"
+  service:
+    host: "0.0.0.0"
+    port: 8282
+    cert_file: "ssl_certs/localhost.crt"
+    cert_key: "ssl_certs/localhost.key"
+  chat_engine:
+    model_root: "models"
+    concurrent_limit: 2
+    handler_search_path:
+      - "src/handlers"
+    handler_configs:
+      RtcClient:
+        module: client/rtc_client/client_handler_rtc
+        # max time a session will last for
+        connection_ttl: 900
+      # === 打断处理器 - 接收 INTERRUPT 信号并执行流取消 ===
+      InterruptHandler:
+        module: logic/interrupt/interrupt_handler
+      SileroVad:
+        module: vad/silerovad/vad_handler_silero
+        speaking_threshold: 0.5
+        start_delay: 2048
+        end_delay: 5000
+        buffer_look_back: 5000
+        speech_padding: 512
+      SenseVoice:
+        enabled: True
+        module: asr/sensevoice/asr_handler_sensevoice
+        model_name: "iic/SenseVoiceSmall"
+
+      # === 希灵 TTS (百度流式语音合成) ===
+      XilingTTS:
+        enabled: True
+        module: tts/xiling_tts/tts_handler_xiling
+        auth_type: "api_key"  # 选项: api_key, access_token
+        # 两种认证方式，选择一种：
+        # 1. api_key 认证: 提供 API Key
+        # 2. access_token 认证：提供 API Key 和 Secret Key
+        api_key: ""  # 百度智能云 API Key，或设置环境变量 XILING_API_KEY
+        secret_key: ""  # 百度智能云 Secret Key，或设置环境变量 XILING_SECRET_KEY
+        access_token: ""  # 百度智能云访问令牌，或设置环境变量 XILING_ACCESS_TOKEN
+        per: "5118"  # 发音人 ID，默认度小娇
+        sample_rate: 16000  # 百度 TTS 输出 16kHz
+        spd: 5  # 语速，0-15，默认5
+        pit: 5  # 音调，0-15，默认5
+        vol: 5  # 音量，0-15，默认5
+        aue: 3  # 音频编码格式，默认 3=mp3-16k/24k
+      LLMOpenAICompatible:
+        enabled: True
+        module: llm/openai_compatible/llm_handler_openai_compatible
+        model_name: "ernie-4.5-turbo-20260402"
+        enable_video_input: False # ensure your llm support video input
+        history_length: 20
+        # model_name: "gemini-2.0-flash"
+        system_prompt: "请你扮演一个 AI 助手，用简短的两三句对话来回答用户的问题，并在对话内容中加入合适的标点符号，不需要讨论标点符号相关的内容"
+        api_url: "https://qianfan.baidubce.com/v2"
+        # api_url: 'http://127.0.0.1:11434/v1' # ollama
+        # api_url: 'https://generativelanguage.googleapis.com/v1beta/openai/'
+        # api_key: "" # default=os.getenv("DASHSCOPE_API_KEY")
+      # === 数字人渲染 ===
+      LiteAvatar:
+        enabled: True
+        module: avatar/liteavatar/avatar_handler_liteavatar
+        avatar_name: 20250408/sample_data
+        fps: 25  # 与 TTS 输出对齐
+        debug: false
+        enable_fast_mode: false
+        use_gpu: true
+
