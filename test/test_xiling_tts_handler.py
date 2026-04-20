@@ -52,14 +52,14 @@ class XilingTTSClient:
         
     async def synthesize(self, text: str, output_file: str = None):
         """
-        合成文本为语音（按官方 Demo 流程）
+        合成文本为语音（与 tts_handler_xiling.py 相同的流程）
         """
-        # URL 只带 per 参数
+        # URL 参数
         params = {
             "per": self.per,
         }
         
-        # 使用 API Key 鉴权
+        # 使用 API Key 鉴权 (与 handler 一致)
         extra_headers = {
             "Authorization": f"Bearer {self.api_key}"
         }
@@ -68,6 +68,7 @@ class XilingTTSClient:
         
         print(f"[*] 步骤1: 握手建立连接...")
         print(f"[*] URL: {url}")
+        print(f"[*] 鉴权方式: Authorization Header (API Key)")
         print(f"[*] 文本长度: {len(text)} 字符")
         
         try:
@@ -82,7 +83,6 @@ class XilingTTSClient:
                         "spd": self.spd,
                         "pit": self.pit,
                         "vol": self.vol,
-                        "audio_ctrl": "{\"sampling_rate\":16000}",
                         "aue": self.aue
                     }
                 }
