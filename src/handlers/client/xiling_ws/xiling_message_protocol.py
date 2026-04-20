@@ -80,6 +80,12 @@ class TextMessageBody:
             streamId=data.get("streamId", "")
         )
 
+    @classmethod
+    def from_json(cls, json_str: str) -> "TextMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+
 
 @dataclass
 class StartMessageBody:
@@ -103,6 +109,12 @@ class StartMessageBody:
             sampleRate=data.get("sampleRate", 16000)
         )
 
+    @classmethod
+    def from_json(cls, json_str: str) -> "StartMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+
 
 @dataclass
 class CompleteMessageBody:
@@ -123,6 +135,12 @@ class CompleteMessageBody:
             event=data.get("event", "COMPLETE")
         )
 
+    @classmethod
+    def from_json(cls, json_str: str) -> "CompleteMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
+
 
 @dataclass
 class InterruptMessageBody:
@@ -138,6 +156,12 @@ class InterruptMessageBody:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "InterruptMessageBody":
         return cls(streamId=data.get("streamId"))
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "InterruptMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls.from_dict(data)
 
 
 # ============================================================================
@@ -155,6 +179,12 @@ class ReadyMessageBody:
             "streamId": self.streamId,
             "event": self.event
         })
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "ReadyMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls(streamId=data.get("streamId", ""), event=data.get("event", "READY"))
 
 
 @dataclass
@@ -195,6 +225,12 @@ class InterruptedMessageBody:
             data["streamId"] = self.streamId
         return json.dumps(data)
 
+    @classmethod
+    def from_json(cls, json_str: str) -> "InterruptedMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls(streamId=data.get("streamId"), event=data.get("event", "INTERRUPTED"))
+
 
 @dataclass
 class ErrorMessageBody:
@@ -211,6 +247,16 @@ class ErrorMessageBody:
         if self.code is not None:
             data["code"] = self.code
         return json.dumps(data)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> "ErrorMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls(
+            event=data.get("event", "ERROR"),
+            message=data.get("message", ""),
+            code=data.get("code")
+        )
 
 
 # ============================================================================

@@ -326,31 +326,38 @@ class XilingWsHandler(ClientHandlerBase):
         """处理 TEXT 消息 - 文本驱动"""
         try:
             body = TextMessageBody.from_json(message.body)
-            
+
             if not body.text:
                 await self._send_error(connection, message.id, "Text is empty")
                 return
-            
+
             logger.info(f"Text drive: streamId={body.streamId}, text={body.text[:50]}...")
-            
+
             # 发送 START 确认
+            logger.info(f"Sending START response for stream {body.streamId}")
             await self._send_message(
                 connection, message.id, MessageType.START.value,
                 StartMessageBody(streamId=body.streamId, event="START")
             )
-            
+
             # 提交文本到会话
             if connection.session_delegate:
+                logger.info(f"Submitting text to session delegate")
                 connection.session_delegate.put_text_data(body.text, body.streamId)
-            
+            else:
+                logger.warning(f"Session delegate is None for connection {connection.connection_id}")
+
             # 发送 COMPLETE
+            logger.info(f"Sending COMPLETE response for stream {body.streamId}")
             await self._send_message(
                 connection, message.id, MessageType.COMPLETE.value,
                 CompleteMessageBody(streamId=body.streamId, event="COMPLETE")
             )
-            
+
         except Exception as e:
             logger.error(f"Handle text drive error: {e}")
+            import traceback
+            traceback.print_exc()
             await self._send_error(connection, message.id, f"Text drive failed: {e}")
     
     async def _handle_audio_start(self, connection: XilingConnection, message: XilingMessage):
@@ -451,7 +458,7 @@ class XilingWsHandler(ClientHandlerBase):
         """发送错误消息"""
         await self._send_message(
             connection, msg_id, MessageType.ERROR.value,
-            ErrorMessageBody(streamId=connection.current_stream_id, event="ERROR", message=error)
+            ErrorMessageBody(event="ERROR", message=error)
         )
     
     async def _send_message(self, connection: XilingConnection, msg_id: int, msg_type: str, body: Any):
