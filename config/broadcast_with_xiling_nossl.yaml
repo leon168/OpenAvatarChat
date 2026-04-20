@@ -1,0 +1,70 @@
+default:
+  logger:
+    log_level: "INFO"
+  service:
+    host: "0.0.0.0"
+    port: 8282
+    # 禁用 SSL 证书
+    # cert_file: "ssl_certs/localhost.crt"
+    # cert_key: "ssl_certs/localhost.key"
+  chat_engine:
+    model_root: "models"
+    concurrent_limit: 2
+    handler_search_path:
+      - "src/handlers"
+    handler_configs:
+
+      # === 打断处理器 ===
+      InterruptHandler:
+        enabled: True
+        module: logic/interrupt/interrupt_handler
+
+      # === 希灵 WebSocket 客户端 (接收外部文本输入，百度数字人兼容接口) ===
+      XilingWebSocket:
+        enabled: True
+        module: client/xiling_ws/xiling_ws_handler
+        path: "/ws/xiling"
+        sample_rate: 16000
+        connection_ttl: 3600
+        # 流标识配置
+        builder_id: "xiling"
+        stream_id: "live"
+
+      # === 希灵 TTS (百度流式语音合成) ===
+      XilingTTS:
+        enabled: True
+        module: tts/xiling_tts/tts_handler_xiling
+        auth_type: "api_key"
+        api_key: ""
+        secret_key: ""
+        access_token: ""
+        per: "5118"
+        sample_rate: 16000
+        spd: 5
+        pit: 5
+        vol: 5
+        aue: 3
+
+      # === 数字人渲染 ===
+      LiteAvatar:
+        enabled: True
+        module: avatar/liteavatar/avatar_handler_liteavatar
+        avatar_name: "20250408/sample_data"
+        fps: 25
+        debug: false
+        enable_fast_mode: false
+        use_gpu: true
+
+      # === SRT 直播输出 (推流到 SRS) ===
+      SRTOutput:
+        enabled: True
+        module: output/srt/srt_handler
+        srt_url: "srt://127.0.0.1:10080?streamid=#!::r=live/avatar,m=publish"
+        latency_ms: 120
+        video_width: 512
+        video_height: 512
+        fps: 25
+        video_bitrate: 2000
+        audio_bitrate: 128
+        preset: fast
+        tune: zerolatency

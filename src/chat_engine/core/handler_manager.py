@@ -109,12 +109,22 @@ class HandlerManager:
             dur_load = time.monotonic() - load_start
             logger.info(f"Handler {registry.base_info.name} loaded in {round(dur_load * 1e3)} milliseconds")
         if app is not None or ui is not None:
+            logger.info(f"on_setup_app condition met: app={app is not None}, ui={ui is not None}")
+            logger.info(f"Client handlers to setup: {[r.base_info.name for r in client_handlers]}")
             for registry in client_handlers:
                 setup_start = time.monotonic()
-                registry.handler.on_setup_app(app, ui, parent_block)
-                dur_setup = time.monotonic() - setup_start
-                logger.info(
-                    f"Setup client handler {registry.base_info.name} loaded in {round(dur_setup * 1e3)} milliseconds")
+                logger.info(f"Calling on_setup_app for {registry.base_info.name}")
+                try:
+                    registry.handler.on_setup_app(app, ui, parent_block)
+                    dur_setup = time.monotonic() - setup_start
+                    logger.info(
+                        f"Setup client handler {registry.base_info.name} loaded in {round(dur_setup * 1e3)} milliseconds")
+                except Exception as e:
+                    logger.error(f"Failed to setup {registry.base_info.name}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        else:
+            logger.warning(f"on_setup_app NOT called: app={app}, ui={ui}")
             for registry in manager_handlers:
                 setup_start = time.monotonic()
                 registry.handler.on_setup_app(app, ui, parent_block)

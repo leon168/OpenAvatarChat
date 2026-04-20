@@ -1,0 +1,18 @@
+default:
+  logger:
+    log_level: "DEBUG"
+  service:
+    host: "0.0.0.0"
+    port: 8282
+  chat_engine:
+    model_root: "models"
+    concurrent_limit: 2
+    handler_search_path:
+      - "src/handlers"
+    handler_configs:
+      XilingWebSocket:
+        enabled: True
+        module: client/xiling_ws/xiling_ws_handler
+        path: "/ws/xiling"
+        sample_rate: 16000
+        connection_ttl: 3600
