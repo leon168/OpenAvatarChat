@@ -9,16 +9,23 @@ import websockets
 
 
 async def test_text_drive():
-    # 使用 localhost
-    host = "localhost"
+    # 使用 localhost 或远程 IP
+    host = "localhost"  # 修改为 "117.50.193.120" 测试远程连接
     port = 8282
     text = "你好，我是数字人"
 
-    # 尝试 ws:// (非加密)
+    # 使用 ws:// (非加密，避免 SSL 证书问题)
     uri = f"ws://{host}:{port}/ws/xiling?appId=test&token=test&liveRoom=test"
     print(f"Connecting to: {uri}")
 
     try:
+        # 如果需要连接 wss://，禁用 SSL 验证
+        # import ssl
+        # ssl_context = ssl.create_default_context()
+        # ssl_context.check_hostname = False
+        # ssl_context.verify_mode = ssl.CERT_NONE
+        # async with websockets.connect(uri, ssl=ssl_context) as ws:
+
         async with websockets.connect(uri) as ws:
             print("Connected, waiting for READY...")
 

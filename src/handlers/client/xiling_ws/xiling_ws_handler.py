@@ -253,11 +253,12 @@ class XilingWsHandler(ClientHandlerBase):
     
     async def _message_loop(self, connection: XilingConnection):
         """消息处理循环"""
+        connection.quit.clear()
         while not connection.quit.is_set():
             try:
                 # 接收消息
                 message = await connection.websocket.receive()
-                
+
                 if "text" in message:
                     await self._handle_text_message(connection, message["text"])
                 elif "bytes" in message:
@@ -265,12 +266,13 @@ class XilingWsHandler(ClientHandlerBase):
                 elif "type" in message and message["type"] == "websocket.ping":
                     # 处理 Ping 帧
                     await self._handle_ping(connection, message.get("bytes", b""))
-                    
+
             except WebSocketDisconnect:
-                break
+                logger.info(f"Connection {connection.connection_id} disconnected by client")
+                connection.quit.set()
             except Exception as e:
                 logger.error(f"Message loop error: {e}")
-                break
+                connection.quit.set()
     
     async def _handle_text_message(self, connection: XilingConnection, text: str):
         """处理文本消息"""
