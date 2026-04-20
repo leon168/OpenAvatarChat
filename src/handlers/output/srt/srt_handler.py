@@ -6,15 +6,7 @@ SRT 推流输出 Handler
 
 重要: ffmpeg 不支持从单个 stdin 同时读取两种 raw 格式输入，
 因此视频通过 stdin 管道传输，音频通过命名管道(FIFO)传输。
-
-SRS SRT 配置:
-  srt_server {
-      enabled on;
-      listen 10080;
-  }
-
-推流 URL 格式:
-  srt://127.0.0.1:10080?streamid=#!::r=live/avatar,m=publish
+FIFO 写入端在后台线程中打开，避免与 stdin 写入死锁。
 """
 
 import os
@@ -59,7 +51,7 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     video_bitrate: int = Field(default=2000, description="视频码率(kbps)")
     audio_sample_rate: int = Field(default=24000, description="音频输入采样率")
     audio_bitrate: int = Field(default=128, description="音频码率(kbps)")
-    preset: str = Field(default="fast", description="x264 预设 (ultrafast, superfast, veryfast, faster, fast, medium)")
+    preset: str = Field(default="fast", description="x264 预设")
     tune: str = Field(default="zerolatency", description="x264 tune 参数")
     ffmpeg_path: str = Field(default="ffmpeg", description="ffmpeg 可执行文件路径")
     srt_url_env: str = Field(default="SRT_URL", description="SRT URL 环境变量名")
@@ -67,12 +59,13 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
 
 @dataclass
 class SRTSession:
-    """SRT 会话状态 - 管理单个 ffmpeg 进程
+    """SRT 会话状态
 
-    视频通过 subprocess stdin 传输，音频通过 FIFO/命名管道 传输。
+    视频通过 subprocess stdin 传输，音频通过 FIFO/TCP 传输。
+    audio_writer 由后台线程异步打开，避免死锁。
     """
     ffmpeg_process: Optional[subprocess.Popen] = None
-    audio_writer: Optional[object] = None  # FIFO fd 或 TCP socket
+    audio_writer: Optional[object] = None  # FIFO fd (int) 或 TCP socket
     audio_fifo_path: Optional[str] = None
     tmp_dir: Optional[str] = None
     frame_count: int = 0
@@ -80,10 +73,15 @@ class SRTSession:
     lock: threading.Lock = field(default_factory=threading.Lock)
     active_streams: Set[str] = field(default_factory=set)
     _audio_server_socket: Optional[socket.socket] = None
+    _audio_ready: threading.Event = field(default_factory=threading.Event)
+    _audio_buffer: list = field(default_factory=list)  # 缓冲 FIFO 打开前的音频数据
 
     def reset(self):
-        """重置会话，关闭 ffmpeg 进程和音频管道"""
+        """重置会话"""
         with self.lock:
+            self._audio_ready.clear()
+            self._audio_buffer.clear()
+
             # 关闭音频写入端
             if self.audio_writer is not None:
                 try:
@@ -119,7 +117,7 @@ class SRTSession:
                         pass
                 self.ffmpeg_process = None
 
-            # 清理 FIFO 文件
+            # 清理 FIFO
             if self.audio_fifo_path and os.path.exists(self.audio_fifo_path):
                 try:
                     os.unlink(self.audio_fifo_path)
@@ -143,6 +141,10 @@ class SRTSession:
     def is_running(self) -> bool:
         return self.ffmpeg_process is not None and self.ffmpeg_process.poll() is None
 
+    def wait_audio_ready(self, timeout: float = 0) -> bool:
+        """等待音频管道就绪"""
+        return self._audio_ready.wait(timeout=timeout)
+
 
 class SRTOutputContext(HandlerContext):
     """SRT 输出 Handler 上下文"""
@@ -157,9 +159,9 @@ class HandlerSRTOutput(HandlerBase):
     """
     SRT 推流输出 Handler
 
-    接收 Avatar 的视频帧和音频数据，通过 ffmpeg 编码并推流到 SRS。
-    视频通过 stdin 管道传输，音频通过命名管道(FIFO)传输，
-    解决 ffmpeg 无法从单个 stdin 同时读取两种 raw 格式输入的问题。
+    视频通过 stdin 管道传输，音频通过命名管道(FIFO)/TCP 传输。
+    音频管道在后台线程中异步打开，视频数据立即写入 stdin，
+    避免 ffmpeg 等待 stdin 数据时无法打开音频输入的死锁问题。
     """
 
     def __init__(self):
@@ -167,53 +169,39 @@ class HandlerSRTOutput(HandlerBase):
         self.config: Optional[SRTOutputConfig] = None
 
     def get_handler_info(self) -> HandlerBaseInfo:
-        return HandlerBaseInfo(
-            config_model=SRTOutputConfig,
-        )
+        return HandlerBaseInfo(config_model=SRTOutputConfig)
 
     def load(self, engine_config: ChatEngineConfigModel, handler_config: Optional[BaseModel] = None):
         self.config = cast(SRTOutputConfig, handler_config or SRTOutputConfig())
 
-        # 优先使用环境变量
         if self.config.srt_url_env in os.environ:
             self.config.srt_url = os.getenv(self.config.srt_url_env, self.config.srt_url)
 
-        # 检查 ffmpeg
         try:
             result = subprocess.run(
                 [self.config.ffmpeg_path, "-protocols"],
-                capture_output=True,
-                text=True,
-                timeout=5
+                capture_output=True, text=True, timeout=5
             )
             if "srt" not in result.stdout:
-                logger.warning(f"ffmpeg 可能不支持 SRT 协议，请检查编译选项: {self.config.ffmpeg_path}")
+                logger.warning(f"ffmpeg 可能不支持 SRT 协议: {self.config.ffmpeg_path}")
             else:
-                logger.info(f"ffmpeg SRT 支持已确认: {self.config.ffmpeg_path}")
+                logger.info(f"ffmpeg SRT 支持已确认")
         except Exception as e:
             logger.error(f"检查 ffmpeg 失败: {e}")
 
         logger.info(f"SRT Output Handler loaded, url={self.config.srt_url}, "
-                   f"latency={self.config.latency_ms}ms, "
                    f"video={self.config.video_width}x{self.config.video_height}@{self.config.fps}fps")
 
     def _build_srt_url(self, config: SRTOutputConfig) -> str:
-        """构建带 latency 参数的 SRT URL"""
         srt_url = config.srt_url
         if "latency=" not in srt_url:
             srt_url = f"{srt_url}&latency={config.latency_ms * 1000}"
         return srt_url
 
-    def _start_ffmpeg_with_fifo(self, config: SRTOutputConfig) -> SRTSession:
-        """Linux/macOS: 使用 FIFO 命名管道传输音频"""
-        # 创建临时目录和音频 FIFO
-        tmp_dir = tempfile.mkdtemp(prefix='srt_')
-        audio_fifo = os.path.join(tmp_dir, 'audio')
-        os.mkfifo(audio_fifo)
-
+    def _build_ffmpeg_command(self, config: SRTOutputConfig, audio_input: str) -> list:
+        """构建 ffmpeg 命令"""
         srt_url = self._build_srt_url(config)
-
-        command = [
+        return [
             config.ffmpeg_path,
             "-y", "-hide_banner", "-loglevel", "warning",
             # 视频输入 (raw RGB from stdin)
@@ -222,10 +210,10 @@ class HandlerSRTOutput(HandlerBase):
             "-r", str(config.fps),
             "-thread_queue_size", "512",
             "-i", "-",
-            # 音频输入 (f32le from FIFO)
+            # 音频输入 (f32le from FIFO or TCP)
             "-f", "f32le", "-ar", str(config.audio_sample_rate), "-ac", "1",
             "-thread_queue_size", "512",
-            "-i", audio_fifo,
+            "-i", audio_input,
             # 视频编码
             "-c:v", "libx264",
             "-preset", config.preset,
@@ -240,161 +228,13 @@ class HandlerSRTOutput(HandlerBase):
             "-b:a", f"{config.audio_bitrate}k",
             "-ar", "44100",
             "-ac", "2",
-            # 输出格式
+            # 输出
             "-f", "mpegts",
             "-flush_packets", "1",
             srt_url
         ]
-
-        logger.info(f"Starting ffmpeg: {' '.join(command)}")
-
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0
-        )
-
-        # 启动 stderr 读取线程
-        self._start_stderr_reader(process)
-
-        # 在单独线程中打开 FIFO 写入端 (避免死锁)
-        # ffmpeg 读取端会阻塞直到写入端打开
-        audio_fd_result = [None]
-        audio_fd_error = [None]
-        audio_fd_ready = threading.Event()
-
-        def open_audio_fifo():
-            try:
-                audio_fd_result[0] = os.open(audio_fifo, os.O_WRONLY)
-            except Exception as e:
-                audio_fd_error[0] = e
-            finally:
-                audio_fd_ready.set()
-
-        threading.Thread(target=open_audio_fifo, daemon=True).start()
-
-        # 等待 FIFO 打开，同时检查 ffmpeg 进程状态
-        # 如果 ffmpeg 在等待期间崩溃，不需要继续等待
-        start_time = time.time()
-        timeout = 10
-        while not audio_fd_ready.is_set():
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                break
-            # 检查 ffmpeg 是否已退出
-            if process.poll() is not None:
-                # ffmpeg 已退出，取消 FIFO 等待
-                retcode = process.poll()
-                logger.error(f"SRT: ffmpeg exited prematurely with code {retcode}")
-                # 尝试读取 stderr 中的错误信息
-                try:
-                    stderr_output = process.stderr.read().decode('utf-8', errors='ignore')
-                    if stderr_output:
-                        logger.error(f"SRT: ffmpeg stderr: {stderr_output[:500]}")
-                except Exception:
-                    pass
-                break
-            audio_fd_ready.wait(timeout=0.5)
-
-        if audio_fd_error[0] is not None:
-            process.kill()
-            raise RuntimeError(f"无法打开音频 FIFO: {audio_fd_error[0]}")
-
-        audio_fd = audio_fd_result[0]
-        if audio_fd is None:
-            process.kill()
-            # 提供更具体的错误信息
-            if process.poll() is not None:
-                raise RuntimeError(f"ffmpeg 启动后立即退出 (code={process.poll()})，无法打开音频 FIFO")
-            raise RuntimeError("打开音频 FIFO 超时")
-
-        session = SRTSession()
-        session.ffmpeg_process = process
-        session.audio_writer = audio_fd
-        session.audio_fifo_path = audio_fifo
-        session.tmp_dir = tmp_dir
-
-        logger.info(f"SRT Output: ffmpeg 已启动 (FIFO 模式)，推流到 {srt_url}")
-        return session
-
-    def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
-        """Windows: 使用 TCP socket 传输音频"""
-        # 创建 TCP 服务端 socket
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(('127.0.0.1', 0))
-        _, audio_port = server_sock.getsockname()
-        server_sock.listen(1)
-
-        srt_url = self._build_srt_url(config)
-        audio_url = f"tcp://127.0.0.1:{audio_port}"
-
-        command = [
-            config.ffmpeg_path,
-            "-y", "-hide_banner", "-loglevel", "warning",
-            # 视频输入 (raw RGB from stdin)
-            "-f", "rawvideo", "-pix_fmt", "rgb24",
-            "-s", f"{config.video_width}x{config.video_height}",
-            "-r", str(config.fps),
-            "-thread_queue_size", "512",
-            "-i", "-",
-            # 音频输入 (f32le from TCP)
-            "-f", "f32le", "-ar", str(config.audio_sample_rate), "-ac", "1",
-            "-thread_queue_size", "512",
-            "-i", audio_url,
-            # 视频编码
-            "-c:v", "libx264",
-            "-preset", config.preset,
-            "-tune", config.tune,
-            "-b:v", f"{config.video_bitrate}k",
-            "-pix_fmt", "yuv420p",
-            "-g", str(config.fps * 2),
-            "-keyint_min", str(config.fps),
-            "-sc_threshold", "0",
-            # 音频编码
-            "-c:a", "aac",
-            "-b:a", f"{config.audio_bitrate}k",
-            "-ar", "44100",
-            "-ac", "2",
-            # 输出格式
-            "-f", "mpegts",
-            "-flush_packets", "1",
-            srt_url
-        ]
-
-        logger.info(f"Starting ffmpeg: {' '.join(command)}")
-
-        process = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            bufsize=0
-        )
-
-        # 启动 stderr 读取线程
-        self._start_stderr_reader(process)
-
-        # 等待 ffmpeg 连接到 TCP socket
-        server_sock.settimeout(10)
-        try:
-            conn, _ = server_sock.accept()
-        except socket.timeout:
-            process.kill()
-            raise RuntimeError("等待 ffmpeg 连接音频 TCP 超时")
-
-        session = SRTSession()
-        session.ffmpeg_process = process
-        session.audio_writer = conn
-        session._audio_server_socket = server_sock
-
-        logger.info(f"SRT Output: ffmpeg 已启动 (TCP 模式)，推流到 {srt_url}")
-        return session
 
     def _start_stderr_reader(self, process: subprocess.Popen):
-        """启动 stderr 读取线程"""
         def read_stderr():
             while process.poll() is None:
                 try:
@@ -403,11 +243,98 @@ class HandlerSRTOutput(HandlerBase):
                         logger.warning(f"ffmpeg: {line.decode('utf-8', errors='ignore').strip()}")
                 except Exception:
                     break
-
         threading.Thread(target=read_stderr, daemon=True).start()
 
+    def _start_ffmpeg_with_fifo(self, config: SRTOutputConfig) -> SRTSession:
+        """Linux/macOS: FIFO 模式。音频管道在后台线程异步打开。"""
+        tmp_dir = tempfile.mkdtemp(prefix='srt_')
+        audio_fifo = os.path.join(tmp_dir, 'audio')
+        os.mkfifo(audio_fifo)
+
+        command = self._build_ffmpeg_command(config, audio_fifo)
+        logger.info(f"Starting ffmpeg (FIFO): {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+        )
+        self._start_stderr_reader(process)
+
+        session = SRTSession()
+        session.ffmpeg_process = process
+        session.audio_fifo_path = audio_fifo
+        session.tmp_dir = tmp_dir
+
+        # 后台线程：等待 ffmpeg 打开 FIFO 读取端，然后打开写入端
+        def open_audio_fifo():
+            try:
+                fd = os.open(audio_fifo, os.O_WRONLY)
+                with session.lock:
+                    session.audio_writer = fd
+                    # 写入缓冲的音频数据
+                    for buf in session._audio_buffer:
+                        try:
+                            os.write(fd, buf)
+                        except Exception:
+                            break
+                    session._audio_buffer.clear()
+                session._audio_ready.set()
+                logger.info("SRT: 音频 FIFO 已打开")
+            except Exception as e:
+                logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
+                session._audio_ready.set()
+
+        threading.Thread(target=open_audio_fifo, daemon=True).start()
+
+        logger.info(f"SRT Output: ffmpeg 已启动 (FIFO 模式)")
+        return session
+
+    def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
+        """Windows: TCP 模式。音频管道在后台线程异步打开。"""
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_sock.bind(('127.0.0.1', 0))
+        _, audio_port = server_sock.getsockname()
+        server_sock.listen(1)
+
+        audio_url = f"tcp://127.0.0.1:{audio_port}"
+        command = self._build_ffmpeg_command(config, audio_url)
+        logger.info(f"Starting ffmpeg (TCP): {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+        )
+        self._start_stderr_reader(process)
+
+        session = SRTSession()
+        session.ffmpeg_process = process
+        session._audio_server_socket = server_sock
+
+        def accept_audio_connection():
+            try:
+                server_sock.settimeout(15)
+                conn, _ = server_sock.accept()
+                with session.lock:
+                    session.audio_writer = conn
+                    for buf in session._audio_buffer:
+                        try:
+                            conn.sendall(buf)
+                        except Exception:
+                            break
+                    session._audio_buffer.clear()
+                session._audio_ready.set()
+                logger.info("SRT: 音频 TCP 连接已建立")
+            except Exception as e:
+                logger.error(f"SRT: 等待音频 TCP 连接失败: {e}")
+                session._audio_ready.set()
+
+        threading.Thread(target=accept_audio_connection, daemon=True).start()
+
+        logger.info(f"SRT Output: ffmpeg 已启动 (TCP 模式)")
+        return session
+
     def _start_ffmpeg(self, config: SRTOutputConfig) -> SRTSession:
-        """启动 ffmpeg 进程，根据平台选择音频传输方式"""
         if IS_WINDOWS:
             return self._start_ffmpeg_with_tcp(config)
         else:
@@ -424,26 +351,19 @@ class HandlerSRTOutput(HandlerBase):
 
     def get_handler_detail(self, session_context: SessionContext,
                            context: HandlerContext) -> HandlerDetail:
-        inputs = [
-            HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
-            HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
-        ]
-        outputs = []
-
         return HandlerDetail(
-            inputs=inputs,
-            outputs=outputs,
-            signal_filters=[
-                SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, None)
-            ]
+            inputs=[
+                HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
+                HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
+            ],
+            outputs=[],
+            signal_filters=[SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, None)]
         )
 
     def _ensure_session(self, context: SRTOutputContext) -> SRTSession:
-        """确保有一个活跃的 ffmpeg 会话"""
         if context.session is not None and context.session.is_running:
             return context.session
 
-        # 清理旧会话
         if context.session is not None:
             context.session.reset()
             context.session = None
@@ -462,12 +382,7 @@ class HandlerSRTOutput(HandlerBase):
         if not session.is_running:
             return False
 
-        if video_frame is None:
-            logger.debug("SRT: video frame is None, skipping")
-            return True
-
-        if video_frame.size == 0:
-            logger.warning(f"SRT: video frame size is 0, shape: {video_frame.shape}")
+        if video_frame is None or video_frame.size == 0:
             return True
 
         try:
@@ -485,7 +400,7 @@ class HandlerSRTOutput(HandlerBase):
             elif video_frame.shape[2] == 4:
                 video_frame = video_frame[:, :, :3]
 
-            # BGR -> RGB (LiteAvatar 输出 BGR, ffmpeg 需要 rgb24)
+            # BGR -> RGB
             video_frame = video_frame[:, :, ::-1]
 
             # 调整尺寸
@@ -496,7 +411,6 @@ class HandlerSRTOutput(HandlerBase):
                 import cv2
                 video_frame = cv2.resize(video_frame, (target_width, target_height))
 
-            # 写入 stdin
             with session.lock:
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
                     return False
@@ -516,10 +430,9 @@ class HandlerSRTOutput(HandlerBase):
             return False
 
     def _write_audio(self, session: SRTSession, audio_data: np.ndarray):
-        """写入音频数据到音频管道 (FIFO 或 TCP socket)
+        """写入音频数据到音频管道
 
-        LiteAvatar 输出 int16 PCM, shape (1, N), 24000Hz。
-        ffmpeg 期望 f32le 格式，值域 [-1.0, 1.0]。
+        如果音频管道尚未就绪，数据会被缓冲，管道就绪后一次性写入。
         """
         if not session.is_running:
             return False
@@ -528,10 +441,8 @@ class HandlerSRTOutput(HandlerBase):
             return True
 
         try:
-            # 展平为 1D 数组 (处理 (1, N) shape)
+            # 展平 + 转换为归一化 float32
             audio_data = audio_data.flatten()
-
-            # int16 -> 归一化 float32 [-1.0, 1.0]
             if audio_data.dtype == np.int16:
                 audio_data = audio_data.astype(np.float32) / 32768.0
             elif audio_data.dtype != np.float32:
@@ -543,13 +454,18 @@ class HandlerSRTOutput(HandlerBase):
             audio_bytes = audio_data.tobytes()
 
             with session.lock:
-                if session.audio_writer is None:
-                    return False
-
-                if isinstance(session.audio_writer, socket.socket):
-                    session.audio_writer.sendall(audio_bytes)
-                elif isinstance(session.audio_writer, int):
-                    os.write(session.audio_writer, audio_bytes)
+                if session.audio_writer is not None:
+                    # 管道已就绪，直接写入
+                    if isinstance(session.audio_writer, socket.socket):
+                        session.audio_writer.sendall(audio_bytes)
+                    elif isinstance(session.audio_writer, int):
+                        os.write(session.audio_writer, audio_bytes)
+                else:
+                    # 管道未就绪，缓冲数据（限制缓冲量避免内存膨胀）
+                    if len(session._audio_buffer) < 100:
+                        session._audio_buffer.append(audio_bytes)
+                    else:
+                        logger.warning("SRT: 音频缓冲已满，丢弃数据")
 
                 session.audio_sample_count += len(audio_data)
 
@@ -564,64 +480,52 @@ class HandlerSRTOutput(HandlerBase):
 
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
-        """处理输入数据 - 音视频流共享同一个 ffmpeg 进程"""
         context = cast(SRTOutputContext, context)
 
         input_stream = inputs.stream_id
         stream_key_str = str(input_stream.key) if input_stream and input_stream.key else "unknown"
 
-        # 确保有活跃的 ffmpeg 会话
         session = self._ensure_session(context)
         if session is None:
             logger.error("SRT Output: 无法创建 ffmpeg 会话")
             return
 
-        # 记录活跃流
         stream_id_str = f"{inputs.type.value}:{stream_key_str}"
         if stream_id_str not in session.active_streams:
             session.active_streams.add(stream_id_str)
             logger.info(f"SRT Output: 新流加入 {stream_id_str}, 活跃流: {session.active_streams}")
 
-        # 根据数据类型分发处理
         if inputs.type == ChatDataType.AVATAR_VIDEO:
             video_frame = inputs.data.get_main_data()
             if not self._write_video(session, video_frame):
-                # 写入失败，重置会话
                 session.reset()
                 context.session = None
 
         elif inputs.type == ChatDataType.AVATAR_AUDIO:
             audio_data = inputs.data.get_main_data()
             if not self._write_audio(session, audio_data):
-                # 写入失败，重置会话
                 session.reset()
                 context.session = None
 
-            # 如果是最后一帧音频，检查是否需要关闭会话
             if inputs.is_last_data:
                 session.active_streams.discard(stream_id_str)
-                logger.info(f"SRT Output: 音频流结束 {stream_id_str}, 剩余活跃流: {session.active_streams}")
-
+                logger.info(f"SRT Output: 音频流结束 {stream_id_str}, 剩余: {session.active_streams}")
                 if not session.active_streams:
-                    logger.info("SRT Output: 所有流结束，关闭 ffmpeg 会话")
+                    logger.info("SRT Output: 所有流结束，关闭会话")
                     session.reset()
                     context.session = None
 
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
-        """处理打断信号"""
         context = cast(SRTOutputContext, context)
-
         if signal.type == ChatSignalType.STREAM_CANCEL:
-            logger.info("SRT Output: 收到取消信号，关闭 ffmpeg 会话")
+            logger.info("SRT Output: 收到取消信号")
             if context.session is not None:
                 context.session.reset()
                 context.session = None
 
     def destroy_context(self, context: HandlerContext):
-        """销毁上下文"""
         context = cast(SRTOutputContext, context)
         logger.info("SRT Output: 销毁上下文")
-
         if context.session is not None:
             try:
                 context.session.reset()
