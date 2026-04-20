@@ -154,6 +154,16 @@ class InterruptMessageBody:
         return json.dumps(data)
 
     @classmethod
+    def from_json(cls, json_str: str) -> "InterruptMessageBody":
+        """从 JSON 字符串创建对象"""
+        data = json.loads(json_str)
+        return cls(streamId=data.get("streamId"))
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "InterruptMessageBody":
+        return cls(streamId=data.get("streamId"))
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "InterruptMessageBody":
         return cls(streamId=data.get("streamId"))
 

@@ -62,6 +62,15 @@ class XilingSessionDelegate(ClientSessionDelegate):
             return self.clock.get_timestamp()
         return (0, 16000)
 
+    def put_text_data(self, text: str, stream_id: str):
+        """提交文本数据到引擎"""
+        logger.info(f"XilingSessionDelegate.put_text_data: text={text[:50]}..., stream_id={stream_id}")
+        self.put_data(
+            modality=EngineChannelType.TEXT,
+            data=text,
+            timestamp=None
+        )
+
     def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
                  timestamp: Optional[Tuple[int, int]] = None,
                  samplerate: Optional[int] = None, loopback: bool = False):
