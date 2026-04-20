@@ -69,4 +69,3 @@ default:
         debug: false
         enable_fast_mode: false
         use_gpu: true
-

@@ -13,12 +13,6 @@ default:
       - "src/handlers"
     handler_configs:
 
-      # === WebRTC 客户端 (输出视频流到浏览器/播放器) ===
-      RtcClient:
-        enabled: True
-        module: client/rtc_client/client_handler_rtc
-        connection_ttl: 3600
-
       # === 打断处理器 ===
       InterruptHandler:
         enabled: True
@@ -31,6 +25,9 @@ default:
         path: "/ws/xiling"
         sample_rate: 16000
         connection_ttl: 3600
+        # 流标识配置
+        builder_id: "xiling"
+        stream_id: "live"
 
       # === 希灵 TTS (百度流式语音合成) ===
       XilingTTS:
@@ -59,3 +56,18 @@ default:
         debug: false
         enable_fast_mode: false
         use_gpu: true
+
+      # === SRT 直播输出 (推流到 SRS) ===
+      SRTOutput:
+        enabled: True
+        module: output/srt/srt_handler
+        srt_url: "srt://127.0.0.1:10080?streamid=#!::r=live/avatar,m=publish"
+        latency_ms: 120
+        video_width: 512
+        video_height: 512
+        fps: 25
+        video_bitrate: 2000
+        audio_bitrate: 128
+        preset: fast
+        tune: zerolatency
+

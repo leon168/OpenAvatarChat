@@ -1,0 +1,13 @@
+[project]
+name = "srtoutput"
+version = "0.1.0"
+description = "SRT streaming output handler for OpenAvatarChat"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.20.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+]
