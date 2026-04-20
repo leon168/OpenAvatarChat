@@ -203,7 +203,7 @@ class HandlerSRTOutput(HandlerBase):
         srt_url = self._build_srt_url(config)
         return [
             config.ffmpeg_path,
-            "-y", "-hide_banner", "-loglevel", "warning",
+            "-y", "-hide_banner", "-loglevel", "info",
             # 视频输入 (raw RGB from stdin)
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{config.video_width}x{config.video_height}",
@@ -236,11 +236,22 @@ class HandlerSRTOutput(HandlerBase):
 
     def _start_stderr_reader(self, process: subprocess.Popen):
         def read_stderr():
-            while process.poll() is None:
+            while True:
                 try:
                     line = process.stderr.readline()
-                    if line:
-                        logger.warning(f"ffmpeg: {line.decode('utf-8', errors='ignore').strip()}")
+                    if not line:
+                        if process.poll() is not None:
+                            # 进程已退出，读取剩余数据
+                            remaining = process.stderr.read()
+                            if remaining:
+                                for l in remaining.decode('utf-8', errors='ignore').strip().split('\n'):
+                                    if l:
+                                        logger.warning(f"ffmpeg: {l}")
+                            break
+                        continue
+                    text = line.decode('utf-8', errors='ignore').strip()
+                    if text:
+                        logger.warning(f"ffmpeg: {text}")
                 except Exception:
                     break
         threading.Thread(target=read_stderr, daemon=True).start()
@@ -380,9 +391,11 @@ class HandlerSRTOutput(HandlerBase):
     def _write_video(self, session: SRTSession, video_frame: np.ndarray):
         """写入视频帧到 ffmpeg stdin"""
         if not session.is_running:
+            logger.warning(f"SRT: _write_video skipped - session not running, ffmpeg poll={session.ffmpeg_process.poll() if session.ffmpeg_process else 'N/A'}")
             return False
 
         if video_frame is None or video_frame.size == 0:
+            logger.debug(f"SRT: video frame empty, None={video_frame is None}")
             return True
 
         try:
@@ -497,7 +510,9 @@ class HandlerSRTOutput(HandlerBase):
 
         if inputs.type == ChatDataType.AVATAR_VIDEO:
             video_frame = inputs.data.get_main_data()
+            logger.debug(f"SRT: AVATAR_VIDEO received, frame={'None' if video_frame is None else f'shape={video_frame.shape} dtype={video_frame.dtype}'}")
             if not self._write_video(session, video_frame):
+                logger.warning("SRT: _write_video failed, resetting session")
                 session.reset()
                 context.session = None
 
