@@ -165,6 +165,9 @@ class SRTOutputContext(HandlerContext):
         super().__init__(session_id)
         self.config: Optional[SRTOutputConfig] = None
         self.session: Optional[SRTSession] = None
+        # 重试控制
+        self._fail_count: int = 0
+        self._last_fail_time: float = 0.0
 
 
 class HandlerSRTOutput(HandlerBase):
@@ -420,25 +423,55 @@ class HandlerSRTOutput(HandlerBase):
             signal_filters=[SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, None)]
         )
 
-    def _ensure_session(self, context: SRTOutputContext) -> SRTSession:
+    def _ensure_session(self, context: SRTOutputContext) -> Optional[SRTSession]:
         if context.session is not None and context.session.is_running:
             # 检查视频写线程是否存活
             if context.session._video_writer_thread is not None and not context.session._video_writer_thread.is_alive():
                 logger.error("SRT: Video writer thread died, resetting session")
+                self._record_failure(context)
                 context.session.reset()
                 context.session = None
             else:
+                # 运行正常，重置失败计数
+                if context._fail_count > 0 and context.session.frame_count > 10:
+                    logger.info("SRT: ffmpeg 运行正常，重置重试计数")
+                    context._fail_count = 0
                 return context.session
+
+        # 重试冷却检查（指数退避：5, 10, 20, 40, 60s）
+        if context._fail_count > 0:
+            cooldown = min(5.0 * (2 ** min(context._fail_count - 1, 4)), 60.0)
+            elapsed = time.time() - context._last_fail_time
+            if elapsed < cooldown:
+                return None  # 冷却中，不重试
+
         if context.session is not None:
             context.session.reset()
             context.session = None
+
+        if context._fail_count > 0:
+            logger.info(f"SRT: 重试启动 ffmpeg (第 {context._fail_count + 1} 次)")
+
         try:
             session = self._start_ffmpeg(context.config)
         except Exception as e:
             logger.error(f"SRT Output: 启动 ffmpeg 失败: {e}")
+            self._record_failure(context)
             return None
+
         context.session = session
         return session
+
+    def _record_failure(self, context: SRTOutputContext):
+        """记录失败并输出诊断信息"""
+        context._fail_count += 1
+        context._last_fail_time = time.time()
+        if context._fail_count == 1:
+            logger.error(
+                f"SRT: ffmpeg 连接失败！请确认 SRS 服务器是否在 "
+                f"{context.config.srt_url} 上运行。"
+                f"后续将自动重试（指数退避）。"
+            )
 
     _video_frame_logged = False  # 只记录第一帧的详细信息
 
@@ -590,12 +623,14 @@ class HandlerSRTOutput(HandlerBase):
         if inputs.type == ChatDataType.AVATAR_VIDEO:
             video_frame = inputs.data.get_main_data()
             if not self._write_video(session, video_frame):
+                self._record_failure(context)
                 session.reset()
                 context.session = None
 
         elif inputs.type == ChatDataType.AVATAR_AUDIO:
             audio_data = inputs.data.get_main_data()
             if not self._write_audio(session, audio_data):
+                self._record_failure(context)
                 session.reset()
                 context.session = None
 
