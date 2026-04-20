@@ -248,20 +248,34 @@ class HandlerSRTOutput(HandlerBase):
             with session.lock:
                 # 写入视频帧 (RGB -> bytes)
                 if video_frame is not None and video_frame.size > 0:
+                    logger.debug(f"Video frame: shape={video_frame.shape}, dtype={video_frame.dtype}, size={video_frame.size}")
+
                     # 确保格式正确
                     if video_frame.dtype != np.uint8:
                         video_frame = (video_frame * 255).clip(0, 255).astype(np.uint8)
-                    
+
                     # 调整尺寸
-                    if video_frame.shape[:2] != (self.config.video_height, self.config.video_width):
+                    target_width = self.config.video_width if self.config.video_width > 0 else 512
+                    target_height = self.config.video_height if self.config.video_height > 0 else 512
+
+                    logger.debug(f"Target size: {target_width}x{target_height}, current: {video_frame.shape[:2]}")
+
+                    if video_frame.shape[:2] != (target_height, target_width):
                         import cv2
-                        video_frame = cv2.resize(video_frame, (self.config.video_width, self.config.video_height))
-                    
+                        video_frame = cv2.resize(video_frame, (target_width, target_height))
+                        logger.debug(f"Resized to: {video_frame.shape}")
+
                     # 转换为 RGB bytes
-                    if len(video_frame.shape) == 3 and video_frame.shape[2] == 3:
-                        rgb_bytes = video_frame.tobytes()
-                        session.ffmpeg_process.stdin.write(rgb_bytes)
-                        session.frame_count += 1
+                    rgb_bytes = video_frame.tobytes()
+                    session.ffmpeg_process.stdin.write(rgb_bytes)
+                    session.frame_count += 1
+
+                    if session.frame_count % 25 == 0:
+                        logger.info(f"Sent {session.frame_count} frames to ffmpeg")
+                elif video_frame is None:
+                    logger.warning("Video frame is None")
+                else:
+                    logger.warning(f"Video frame size is 0, shape: {video_frame.shape}")
                 
                 # 写入音频 (float32 -> bytes)
                 if audio_data is not None and audio_data.size > 0:
