@@ -587,6 +587,8 @@ class ChatStreamer:
 
     @property
     def auto_link_input(self):
+        if isinstance(self._default_config, dict):
+            return self._default_config.get('auto_link_input', True)
         return self._default_config.auto_link_input
 
     @property
