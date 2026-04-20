@@ -4,12 +4,14 @@ SRT 推流输出 Handler
 将 Avatar 的视频和音频输出通过 SRT 协议推送到 SRS 服务器
 依赖: ffmpeg (需支持 libsrt)
 
-视频通过 stdin 管道传输，音频通过命名管道(FIFO)/TCP 传输。
-I/O 写操作在锁外执行，避免死锁。
+视频通过队列 + 后台线程写入 stdin，避免 I/O 阻塞 pumper 线程。
+音频通过命名管道(FIFO)/TCP 传输。
+所有 I/O 写操作在锁外执行，避免死锁。
 """
 
 import os
 import platform
+import queue
 import socket
 import subprocess
 import tempfile
@@ -54,6 +56,7 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     tune: str = Field(default="zerolatency", description="x264 tune 参数")
     ffmpeg_path: str = Field(default="ffmpeg", description="ffmpeg 可执行文件路径")
     srt_url_env: str = Field(default="SRT_URL", description="SRT URL 环境变量名")
+    video_queue_size: int = Field(default=30, description="视频帧队列大小(帧数)")
 
 
 @dataclass
@@ -71,9 +74,24 @@ class SRTSession:
     _audio_server_socket: Optional[socket.socket] = None
     _audio_ready: threading.Event = field(default_factory=threading.Event)
     _audio_buffer: list = field(default_factory=list)
+    # 视频帧队列 + 后台写线程
+    _video_queue: queue.Queue = field(default_factory=lambda: queue.Queue(maxsize=30))
+    _video_writer_thread: Optional[threading.Thread] = None
+    _video_writer_quit: threading.Event = field(default_factory=threading.Event)
+    _video_drop_count: int = 0
 
     def reset(self):
         """重置会话"""
+        # 先停止视频写线程
+        self._video_writer_quit.set()
+        try:
+            self._video_queue.put(None, timeout=0.5)  # sentinel
+        except queue.Full:
+            pass
+        if self._video_writer_thread is not None:
+            self._video_writer_thread.join(timeout=3)
+            self._video_writer_thread = None
+
         with self.state_lock:
             self._audio_ready.clear()
             self._audio_buffer.clear()
@@ -127,6 +145,15 @@ class SRTSession:
             self.frame_count = 0
             self.audio_sample_count = 0
             self.active_streams.clear()
+            self._video_drop_count = 0
+
+        # 清空队列
+        while not self._video_queue.empty():
+            try:
+                self._video_queue.get_nowait()
+            except queue.Empty:
+                break
+        self._video_writer_quit.clear()
 
     @property
     def is_running(self) -> bool:
@@ -223,6 +250,57 @@ class HandlerSRTOutput(HandlerBase):
                     break
         threading.Thread(target=read_stderr, daemon=True).start()
 
+    def _start_video_writer(self, session: SRTSession):
+        """启动后台视频写线程，从队列取帧写入 ffmpeg stdin"""
+        session._video_writer_quit.clear()
+
+        def writer_loop():
+            logger.info("SRT: Video writer thread started")
+            while not session._video_writer_quit.is_set():
+                try:
+                    item = session._video_queue.get(timeout=0.1)
+                    if item is None:  # sentinel
+                        break
+                    rgb_bytes, count = item
+
+                    # 检查 ffmpeg 进程状态
+                    if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                        retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else None
+                        logger.error(f"SRT: ffmpeg 已退出 (code={retcode}), 停止视频写入")
+                        break
+
+                    try:
+                        stdin = session.ffmpeg_process.stdin
+                        if stdin is None:
+                            logger.error("SRT: ffmpeg stdin is None")
+                            break
+                        stdin.write(rgb_bytes)
+                        if count == 1:
+                            logger.info("SRT: First video frame written to ffmpeg stdin")
+                        if count % 25 == 0:
+                            logger.info(f"SRT: Sent {count} video frames")
+                    except BrokenPipeError:
+                        logger.error("SRT: ffmpeg stdin pipe broken (video writer thread)")
+                        break
+                    except OSError as e:
+                        logger.error(f"SRT: ffmpeg stdin write error: {e}")
+                        break
+                except queue.Empty:
+                    continue
+
+            # 清空队列
+            while not session._video_queue.empty():
+                try:
+                    session._video_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+            logger.info("SRT: Video writer thread stopped")
+
+        thread = threading.Thread(target=writer_loop, daemon=True, name="srt-video-writer")
+        thread.start()
+        session._video_writer_thread = thread
+
     def _start_ffmpeg_with_fifo(self, config: SRTOutputConfig) -> SRTSession:
         tmp_dir = tempfile.mkdtemp(prefix='srt_')
         audio_fifo = os.path.join(tmp_dir, 'audio')
@@ -241,6 +319,9 @@ class HandlerSRTOutput(HandlerBase):
         session.ffmpeg_process = process
         session.audio_fifo_path = audio_fifo
         session.tmp_dir = tmp_dir
+
+        # 启动视频写线程
+        self._start_video_writer(session)
 
         def open_audio_fifo():
             try:
@@ -286,6 +367,9 @@ class HandlerSRTOutput(HandlerBase):
         session = SRTSession()
         session.ffmpeg_process = process
         session._audio_server_socket = server_sock
+
+        # 启动视频写线程
+        self._start_video_writer(session)
 
         def accept_audio_connection():
             try:
@@ -338,7 +422,13 @@ class HandlerSRTOutput(HandlerBase):
 
     def _ensure_session(self, context: SRTOutputContext) -> SRTSession:
         if context.session is not None and context.session.is_running:
-            return context.session
+            # 检查视频写线程是否存活
+            if context.session._video_writer_thread is not None and not context.session._video_writer_thread.is_alive():
+                logger.error("SRT: Video writer thread died, resetting session")
+                context.session.reset()
+                context.session = None
+            else:
+                return context.session
         if context.session is not None:
             context.session.reset()
             context.session = None
@@ -388,7 +478,7 @@ class HandlerSRTOutput(HandlerBase):
         return video_frame.tobytes()
 
     def _write_video(self, session: SRTSession, video_frame: np.ndarray):
-        """写入视频帧到 ffmpeg stdin（I/O 在锁外执行）"""
+        """将视频帧放入队列，由后台线程写入 ffmpeg stdin（非阻塞）"""
         if not session.is_running:
             return False
 
@@ -398,33 +488,37 @@ class HandlerSRTOutput(HandlerBase):
         try:
             rgb_bytes = self._prepare_video_frame(video_frame)
 
-            # 在锁内获取 stdin 引用和更新计数
+            # 在锁内获取引用和更新计数
             with session.state_lock:
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
-                    logger.warning(f"SRT: ffmpeg 已退出, poll={session.ffmpeg_process.poll() if session.ffmpeg_process else 'N/A'}")
+                    logger.warning("SRT: ffmpeg process not running, cannot queue video frame")
                     return False
-                stdin = session.ffmpeg_process.stdin
                 session.frame_count += 1
                 count = session.frame_count
 
-            if count <= 2:
-                logger.info(f"SRT: Writing video frame #{count}, {len(rgb_bytes)} bytes")
+            if count <= 3:
+                logger.info(f"SRT: Queuing video frame #{count}, {len(rgb_bytes)} bytes")
 
-            # 锁外执行 I/O（避免阻塞其他操作）
-            stdin.write(rgb_bytes)
+            # 非阻塞放入队列
+            try:
+                session._video_queue.put_nowait((rgb_bytes, count))
+            except queue.Full:
+                # 队列满，丢弃当前帧（保持实时性）
+                session._video_drop_count += 1
+                if session._video_drop_count <= 3 or session._video_drop_count % 25 == 0:
+                    logger.warning(f"SRT: Video queue full, dropped frame #{count} "
+                                 f"(total dropped: {session._video_drop_count})")
+                return True  # 不终止会话，只是丢帧
 
-            if count == 1:
-                logger.info("SRT: First video frame written to ffmpeg stdin")
-            if count % 25 == 0:
-                logger.info(f"SRT: Sent {count} video frames")
+            # 检查写线程是否存活
+            if session._video_writer_thread is not None and not session._video_writer_thread.is_alive():
+                logger.error("SRT: Video writer thread died, ffmpeg likely crashed")
+                return False
 
             return True
 
-        except BrokenPipeError:
-            logger.error("SRT: ffmpeg stdin pipe broken (video)")
-            return False
         except Exception as e:
-            logger.error(f"SRT: 写入视频帧失败: {e}")
+            logger.error(f"SRT: Failed to queue video frame: {e}")
             return False
 
     def _write_audio(self, session: SRTSession, audio_data: np.ndarray):
