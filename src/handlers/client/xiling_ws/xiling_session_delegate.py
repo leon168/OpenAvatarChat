@@ -56,14 +56,11 @@ class XilingSessionDelegate(ClientSessionDelegate):
         self.heartbeat_timeout = heartbeat_timeout
         self.last_heartbeat_time = time.time()
 
-    def put_text_data(self, text: str, stream_id: str):
-        """提交文本数据到引擎"""
-        logger.info(f"XilingSessionDelegate.put_text_data called: text={text[:50]}..., stream_id={stream_id}")
-        self.put_data(
-            modality=EngineChannelType.TEXT,
-            data=text,
-            timestamp=None
-        )
+    def get_timestamp(self) -> Tuple[int, int]:
+        """获取时间戳"""
+        if self.clock:
+            return self.clock.get_timestamp()
+        return (0, 16000)
 
     def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
                  timestamp: Optional[Tuple[int, int]] = None,

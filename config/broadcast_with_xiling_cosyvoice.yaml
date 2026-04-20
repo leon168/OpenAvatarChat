@@ -18,46 +18,49 @@ default:
         enabled: True
         module: logic/interrupt/interrupt_handler
 
-      # === 希灵 WebSocket 客户端 (接收外部文本输入，百度数字人兼容接口) ===
+      # === 希灵 WebSocket 客户端 ===
       XilingWebSocket:
         enabled: True
         module: client/xiling_ws/xiling_ws_handler
         path: "/ws/xiling"
         sample_rate: 16000
         connection_ttl: 3600
-        # 流标识配置
         builder_id: "xiling"
         stream_id: "live"
 
-      # === 希灵 TTS (百度流式语音合成) ===
-      XilingTTS:
+      # === CosyVoice TTS ===
+      CosyVoice:
         enabled: True
+        module: tts/bailian_tts/tts_handler_cosyvoice_bailian
+        voice: "longxiaochun"
+        model_name: "cosyvoice-v1"
+
+      # === Xiling TTS (百度流式语音合成) - 已禁用，使用 CosyVoice ===
+      XilingTTS:
+        enabled: False
         module: tts/xiling_tts/tts_handler_xiling
-        auth_type: "api_key"  # 选项: api_key, access_token
-        # 两种认证方式，选择一种：
-        # 1. api_key 认证: 提供 API Key
-        # 2. access_token 认证：提供 API Key 和 Secret Key
-        api_key: ""  # 百度智能云 API Key，或设置环境变量 XILING_API_KEY
-        secret_key: ""  # 百度智能云 Secret Key，或设置环境变量 XILING_SECRET_KEY
-        access_token: ""  # 百度智能云访问令牌，或设置环境变量 XILING_ACCESS_TOKEN
-        per: "5118"  # 发音人 ID，默认度小娇
-        sample_rate: 16000  # 百度 TTS 输出 16kHz
-        spd: 5  # 语速，0-15，默认5
-        pit: 5  # 音调，0-15，默认5
-        vol: 5  # 音量，0-15，默认5
-        aue: 3  # 音频编码格式，默认 3=mp3-16k/24k
+        auth_type: "api_key"
+        api_key: ""
+        secret_key: ""
+        access_token: ""
+        per: "5118"
+        sample_rate: 16000
+        spd: 5
+        pit: 5
+        vol: 5
+        aue: 3
 
       # === 数字人渲染 ===
       LiteAvatar:
         enabled: True
         module: avatar/liteavatar/avatar_handler_liteavatar
-        avatar_name: 20250408/sample_data
+        avatar_name: "20250408/sample_data"
         fps: 25
         debug: false
         enable_fast_mode: false
         use_gpu: true
 
-      # === SRT 直播输出 (推流到 SRS) ===
+      # === SRT 直播输出 ===
       SRTOutput:
         enabled: True
         module: output/srt/srt_handler
@@ -70,4 +73,3 @@ default:
         audio_bitrate: 128
         preset: fast
         tune: zerolatency
-
