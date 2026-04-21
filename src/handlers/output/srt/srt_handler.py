@@ -70,6 +70,8 @@ class SRTSession:
     audio_sample_count: int = 0
     # 用单独的锁保护共享状态，I/O 操作在锁外执行
     state_lock: threading.Lock = field(default_factory=threading.Lock)
+    # 音频写入锁：防止并发 TCP/FIFO 写入导致数据交错
+    audio_write_lock: threading.Lock = field(default_factory=threading.Lock)
     active_streams: Set[str] = field(default_factory=set)
     _audio_server_socket: Optional[socket.socket] = None
     _audio_ready: threading.Event = field(default_factory=threading.Event)
@@ -227,6 +229,7 @@ class HandlerSRTOutput(HandlerBase):
             "-b:a", f"{config.audio_bitrate}k",
             "-ar", "44100",
             "-ac", "2",
+            "-async", "1",
             "-f", "mpegts",
             "-flush_packets", "1",
             srt_url
@@ -334,12 +337,13 @@ class HandlerSRTOutput(HandlerBase):
                     session.audio_writer = fd
                     buffers = list(session._audio_buffer)
                     session._audio_buffer.clear()
-                # 锁外写入缓冲数据
-                for buf in buffers:
-                    try:
-                        os.write(fd, buf)
-                    except Exception:
-                        break
+                # 使用 audio_write_lock 防止与后续 _write_audio 并发写入
+                with session.audio_write_lock:
+                    for buf in buffers:
+                        try:
+                            os.write(fd, buf)
+                        except Exception:
+                            break
                 session._audio_ready.set()
                 logger.info("SRT: 音频 FIFO 已打开")
             except Exception as e:
@@ -382,11 +386,13 @@ class HandlerSRTOutput(HandlerBase):
                     session.audio_writer = conn
                     buffers = list(session._audio_buffer)
                     session._audio_buffer.clear()
-                for buf in buffers:
-                    try:
-                        conn.sendall(buf)
-                    except Exception:
-                        break
+                # 使用 audio_write_lock 防止与后续 _write_audio 并发写入
+                with session.audio_write_lock:
+                    for buf in buffers:
+                        try:
+                            conn.sendall(buf)
+                        except Exception:
+                            break
                 session._audio_ready.set()
                 logger.info("SRT: 音频 TCP 连接已建立")
             except Exception as e:
@@ -518,6 +524,11 @@ class HandlerSRTOutput(HandlerBase):
         if video_frame is None or video_frame.size == 0:
             return True
 
+        # 等待音频连接就绪再写入视频帧，确保音视频同步启动
+        if session.frame_count == 0:
+            if not session._audio_ready.wait(timeout=10.0):
+                logger.warning("SRT: 音频连接未就绪，首帧视频已等待超时，先写入")
+
         try:
             rgb_bytes = self._prepare_video_frame(video_frame)
 
@@ -587,11 +598,12 @@ class HandlerSRTOutput(HandlerBase):
                         logger.warning("SRT: 音频缓冲已满，丢弃数据")
                     return True
 
-            # 锁外执行 I/O
-            if isinstance(writer, socket.socket):
-                writer.sendall(audio_bytes)
-            elif isinstance(writer, int):
-                os.write(writer, audio_bytes)
+            # 锁外执行 I/O（使用 audio_write_lock 防止并发写入导致数据交错）
+            with session.audio_write_lock:
+                if isinstance(writer, socket.socket):
+                    writer.sendall(audio_bytes)
+                elif isinstance(writer, int):
+                    os.write(writer, audio_bytes)
 
             return True
 
