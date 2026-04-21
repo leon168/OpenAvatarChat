@@ -212,11 +212,15 @@ class HandlerSRTOutput(HandlerBase):
         return [
             config.ffmpeg_path,
             "-y", "-hide_banner", "-loglevel", "warning",
+            # Video input - use wallclock timestamps for sync
+            "-use_wallclock_as_timestamps", "1",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{config.video_width}x{config.video_height}",
             "-r", str(config.fps),
             "-thread_queue_size", "512",
             "-i", "-",
+            # Audio input - use wallclock timestamps for sync
+            "-use_wallclock_as_timestamps", "1",
             "-f", "f32le", "-ar", str(config.audio_sample_rate), "-ac", "1",
             "-thread_queue_size", "512",
             "-i", audio_input,
@@ -228,11 +232,11 @@ class HandlerSRTOutput(HandlerBase):
             "-g", str(config.fps * 2),
             "-keyint_min", str(config.fps),
             "-sc_threshold", "0",
+            "-af", "aresample=async=1:first_pts=0",
             "-c:a", "aac",
             "-b:a", f"{config.audio_bitrate}k",
             "-ar", "44100",
             "-ac", "2",
-            "-async", "1",
             "-f", "mpegts",
             "-flush_packets", "1",
             srt_url
