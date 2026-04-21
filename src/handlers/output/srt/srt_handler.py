@@ -660,8 +660,8 @@ class HandlerSRTOutput(HandlerBase):
                            context: HandlerContext) -> HandlerDetail:
         return HandlerDetail(
             inputs=[
-                HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
-                HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
+                HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO, input_priority=-1),
+                HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO, input_priority=-1),
             ],
             outputs=[],
             signal_filters=[SignalFilterRule(ChatSignalType.STREAM_CANCEL, None, None)]

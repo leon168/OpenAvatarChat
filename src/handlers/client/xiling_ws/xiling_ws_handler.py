@@ -545,10 +545,10 @@ class XilingWsHandler(ClientHandlerBase):
     
     def get_handler_detail(self, session_context: SessionContext, context: HandlerContext) -> HandlerDetail:
         """获取 Handler Detail"""
-        inputs = {
-            ChatDataType.AVATAR_AUDIO: HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
-            ChatDataType.AVATAR_VIDEO: HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
-        }
+        # 移除对 AVATAR_AUDIO/VIDEO 的订阅，避免与 SRTOutput 冲突
+        # 状态回报通过 WebSocket 消息协议实现（START/COMPLETE/INTERRUPTED 等）
+        # 参考百度希灵协议：https://xiling.cloud.baidu.com/doc/AI_DH/s/Sm1h9a4dh
+        inputs = {}
 
         _no_link = ChatStreamConfig(cancelable=False, auto_link_input=False)
         _tts_text = ChatStreamConfig(cancelable=True)
