@@ -285,53 +285,50 @@ class HandlerSRTOutput(HandlerBase):
         audio_bytes_per_frame = samples_per_frame * 4
 
         def pacer_loop():
-            # 等待音频连接就绪
-            # 必须等音频就绪后才开始写数据，否则 ffmpeg 视频 PTS 领先音频 PTS，
-            # 造成永久性音视频偏移
-            audio_wait_start = time.time()
-            audio_ready = False
-            audio_timeout = False
+            # FIFO 已经在启动前打开，只需等待音频缓冲积累足够数据
+            # 必须等缓冲足够后才开始写数据，否则音频缓冲会快速耗尽
+            buffer_wait_start = time.time()
             buffer_ready = False
+            buffer_timeout = False
             
             while not session._pacer_quit.is_set():
-                if session._audio_ready.wait(timeout=0.5):
-                    audio_ready = True
-                    break
-                elapsed = time.time() - audio_wait_start
-                # 每 2 秒报告一次状态
-                if int(elapsed * 2) % 2 == 0 and int((elapsed - 0.5) * 2) % 2 != 0:
-                    logger.warning(f"[SYNC] Pacer: Still waiting for audio connection ({elapsed:.0f}s)")
+                elapsed = time.time() - buffer_wait_start
+                
                 # 检查 ffmpeg 是否还在运行
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
                     retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else -1
-                    logger.error(f"[SYNC] Pacer: ffmpeg exited before audio ready (code={retcode})")
+                    logger.error(f"[SYNC] Pacer: ffmpeg exited before buffer ready (code={retcode})")
                     return
-                # 检查音频缓冲是否已有足够数据（至少1帧）
+                
+                # 检查音频缓冲是否已有足够数据（至少2秒，确保同步稳定性）
                 with session._audio_buffer_lock:
                     buf_len = len(session._audio_buffer)
-                    if buf_len >= audio_bytes_per_frame:
+                    # 要求至少 2 秒的音频缓冲才开始，避免缓冲耗尽
+                    min_buffer_bytes = int(sample_rate * 4 * 2)  # 2秒 * 采样率 * 4字节(float32)
+                    if buf_len >= min_buffer_bytes:
                         buffer_ready = True
-                        logger.info(f"[SYNC] Pacer: Audio buffer has {buf_len} bytes ({buf_len / 4 / sample_rate:.2f}s), starting")
+                        logger.info(f"[SYNC] Pacer: Audio buffer ready ({buf_len / 4 / sample_rate:.2f}s), starting")
                         break
-                    else:
-                        logger.debug(f"[SYNC] Pacer: Audio buffer has {buf_len} bytes, waiting...")
-                # 10 秒超时：如果音频连接 10 秒还没建立，用静音继续运行
-                if elapsed > 10.0:
-                    logger.warning("[SYNC] Pacer: Audio connection timeout after 10s, continuing with silence")
-                    audio_timeout = True
+                    elif buf_len >= audio_bytes_per_frame:
+                        logger.debug(f"[SYNC] Pacer: Audio buffer building up ({buf_len / 4 / sample_rate:.2f}s)")
+                
+                # 30 秒超时：如果缓冲 30 秒还没积累足够数据，用静音继续运行
+                if elapsed > 30.0:
+                    logger.warning("[SYNC] Pacer: Audio buffer timeout after 30s, continuing with silence")
+                    buffer_timeout = True
                     break
+                
+                time.sleep(0.05)
             
             # 检查是否收到退出信号
             if session._pacer_quit.is_set():
-                logger.error("[SYNC] Pacer: Quit signal received while waiting for audio connection")
+                logger.error("[SYNC] Pacer: Quit signal received while waiting for buffer")
                 return
             
-            if audio_ready:
-                logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
-            elif buffer_ready:
+            if buffer_ready:
                 logger.info("[SYNC] Pacer: Starting with buffered audio data")
-            elif audio_timeout:
-                logger.info("[SYNC] Pacer: Starting with audio timeout (will use silence)")
+            elif buffer_timeout:
+                logger.info("[SYNC] Pacer: Starting with buffer timeout (will use silence)")
 
             logger.info(f"[SYNC] Pacer started: {fps}fps, {samples_per_frame} samples/frame, "
                        f"{frame_duration*1000:.0f}ms/frame")
@@ -450,18 +447,20 @@ class HandlerSRTOutput(HandlerBase):
                         if excess > 0:
                             del session._audio_buffer[:excess]
 
-                # 5. 检查音频写入器是否可用
+                # 5. 检查音频写入器是否可用（FIFO 应该已经在启动前打开）
                 with session.state_lock:
                     writer = session.audio_writer
-
+                
+                # FIFO 应该已经打开，如果没有则等待一下
                 if writer is None:
-                    # 音频连接断开，检查是否允许静音模式继续运行
-                    if not audio_timeout and not buffer_ready:
-                        # 正常情况下，音频连接断开时不写数据，等待恢复
+                    logger.warning("[SYNC] Pacer: Audio writer not ready, waiting...")
+                    time.sleep(0.1)
+                    with session.state_lock:
+                        writer = session.audio_writer
+                    if writer is None:
+                        # FIFO 仍未打开，跳过这帧
                         session._last_video_bytes = video_bytes
                         continue
-                    # audio_timeout 或 buffer_ready 模式：用静音继续运行
-                    writer = None  # 标记为静音模式
 
                 # 6. 取音频数据（此时 writer 一定不为 None）
                 audio_bytes = None
@@ -513,8 +512,9 @@ class HandlerSRTOutput(HandlerBase):
                     except (BrokenPipeError, OSError, ConnectionError):
                         pass  # 下一个 tick 会检测到 writer 变化
                 else:
-                    # 静音模式：不写入音频，但视频继续写
-                    # ffmpeg 会自动处理缺失的音频（可能产生静音）
+                    # 静音模式：writer 为 None，不写入音频
+                    # 注意：如果 writer 后来变成非 None，需要确保音频同步
+                    # 此时 audio_bytes 应该是静音数据（在前面的逻辑中设置）
                     pass
 
                 # 10. 更新状态
@@ -570,37 +570,29 @@ class HandlerSRTOutput(HandlerBase):
         session.audio_fifo_path = audio_fifo
         session.tmp_dir = tmp_dir
 
-        # 启动同步节奏器
+        # 先打开 FIFO，再启动 pacer（确保 FIFO 在 pacer 启动前就绪）
+        try:
+            fd = os.open(audio_fifo, os.O_WRONLY)
+            with session.state_lock:
+                session.audio_writer = fd
+            logger.info("SRT: 音频 FIFO 已打开")
+            
+            # 将预连接缓冲的数据合并到主缓冲
+            with session._audio_buffer_lock:
+                if session._pre_connect_audio_buffer:
+                    merged_bytes = sum(len(b) for b in session._pre_connect_audio_buffer)
+                    session._audio_buffer.extend(b for chunk in session._pre_connect_audio_buffer for b in chunk)
+                    session._pre_connect_audio_buffer.clear()
+                    logger.info(f"[SYNC] SRT: 合并预连接缓冲 {merged_bytes} bytes")
+            
+            session._audio_ready.set()
+        except Exception as e:
+            logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
+            session._audio_ready.set()
+            raise
+        
+        # FIFO 就绪后再启动同步节奏器
         self._start_sync_pacer(session, config)
-
-        def open_audio_fifo():
-            try:
-                fd = os.open(audio_fifo, os.O_WRONLY)
-                with session.state_lock:
-                    session.audio_writer = fd
-                
-                # 检查 pacer 是否已经在运行（通过 frame_count 判断）
-                if session.frame_count > 0:
-                    # pacer 已经在运行，不要清空缓冲
-                    logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，pacer 已运行 {session.frame_count} 帧")
-                else:
-                    # pacer 还没开始，清空预连接缓冲（这些数据可能太旧）
-                    with session.state_lock:
-                        dropped_chunks = len(session._pre_connect_audio_buffer)
-                        dropped_bytes = sum(len(b) for b in session._pre_connect_audio_buffer)
-                        session._pre_connect_audio_buffer.clear()
-                    if dropped_chunks > 0:
-                        logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，丢弃 {dropped_chunks} 块旧缓冲 "
-                                   f"({dropped_bytes} bytes)")
-                    else:
-                        logger.info("SRT: 音频 FIFO 已打开")
-                
-                session._audio_ready.set()
-            except Exception as e:
-                logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
-                session._audio_ready.set()
-
-        threading.Thread(target=open_audio_fifo, daemon=True).start()
         return session
 
     def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
