@@ -347,6 +347,21 @@ class HandlerSRTOutput(HandlerBase):
             vw_thread = threading.Thread(target=video_writer, daemon=True, name="srt-video-writer")
             vw_thread.start()
 
+            # 裁剪音频缓冲区：确保音视频对齐
+            # pacer 启动前音频可能堆积了几秒（等待连接期间），
+            # 但视频队列有上限会丢旧帧，所以必须裁掉音频多余部分
+            with session._video_queue_lock:
+                vq_len = len(session._video_queue)
+            with session._audio_buffer_lock:
+                max_audio_bytes = (vq_len + 1) * audio_bytes_per_frame  # 比视频多1帧余量
+                if len(session._audio_buffer) > max_audio_bytes:
+                    excess = len(session._audio_buffer) - max_audio_bytes
+                    del session._audio_buffer[:excess]
+                    logger.info(f"[SYNC] Pacer: Trimmed audio buffer by {excess} bytes "
+                               f"({excess / 4 / sample_rate:.2f}s), "
+                               f"remaining={len(session._audio_buffer) / 4 / sample_rate:.2f}s, "
+                               f"video_q={vq_len} frames")
+
             while not session._pacer_quit.is_set():
                 # 1. 计算目标写入时间
                 if start_time is None:
@@ -435,7 +450,7 @@ class HandlerSRTOutput(HandlerBase):
                 session._last_video_bytes = video_bytes
                 tick += 1
 
-                # 9. 定期日志
+                # 9. 定期日志 + 音频缓冲区溢出检查
                 if session.frame_count == 1:
                     logger.info("[SYNC] Pacer: First synced frame+audio written to ffmpeg")
                 if session.frame_count % 500 == 0:
@@ -447,6 +462,16 @@ class HandlerSRTOutput(HandlerBase):
                                f"video_dur={video_dur:.1f}s audio_dur={audio_dur:.1f}s "
                                f"drift={(video_dur-audio_dur)*1000:+.0f}ms "
                                f"video_q={q_len} audio_buf={buf_len}")
+
+                    # 音频堆积超过 2 秒时裁剪（防止音视频漂移）
+                    # 正常情况 audio_buf 应该接近 0（生产≈消费）
+                    max_allowed = sample_rate * 4 * 2  # 2 秒
+                    if buf_len > max_allowed:
+                        with session._audio_buffer_lock:
+                            excess = len(session._audio_buffer) - max_allowed
+                            del session._audio_buffer[:excess]
+                        logger.warning(f"[SYNC] Pacer: Audio buffer overflow, trimmed "
+                                      f"{excess / 4 / sample_rate:.2f}s of old audio")
 
             logger.info("[SYNC] Pacer loop ended, cleaning up video writer thread")
             # 停止视频写线程
