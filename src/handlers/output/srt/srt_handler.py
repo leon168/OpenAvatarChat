@@ -677,6 +677,8 @@ class HandlerSRTOutput(HandlerBase):
 
     def _ensure_session(self, context: SRTOutputContext) -> Optional[SRTSession]:
         if context.session is not None and context.session.is_running:
+            logger.debug(f"[SYNC] _ensure_session: session={context.session}, frame_count={context.session.frame_count}")
+            
             # 检查 ffmpeg 进程是否还在运行
             if context.session.ffmpeg_process is not None and context.session.ffmpeg_process.poll() is not None:
                 retcode = context.session.ffmpeg_process.poll()
@@ -684,11 +686,23 @@ class HandlerSRTOutput(HandlerBase):
                 self._record_failure(context)
                 context.session.reset()
                 context.session = None
+                return None
             
+            # 如果已经有帧输出，说明 pacer 运行正常，跳过线程存活检查
+            if context.session.frame_count > 0:
+                # 运行正常，重置失败计数
+                if context._fail_count > 0 and context.session.frame_count > 10:
+                    logger.info("SRT: ffmpeg 运行正常，重置重试计数")
+                    context._fail_count = 0
+                return context.session
+            
+            # 只有在没有帧输出时才检查 pacer 线程状态
             # 检查节奏器线程是否存活
-            elif context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
+            if context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
+                elapsed = time.time() - context.session._pacer_start_time if context.session._pacer_start_time > 0 else -1
+                logger.error(f"[SYNC] Pacer thread not alive! frame_count={context.session.frame_count}, elapsed={elapsed:.2f}s")
                 # 检查是否是因为等待音频连接而早期退出
-                if context.session.frame_count == 0 and context.session._pacer_start_time > 0:
+                if context.session._pacer_start_time > 0:
                     elapsed = time.time() - context.session._pacer_start_time
                     if elapsed < 10.0:  # 启动后10秒内退出，可能是音频连接问题
                         logger.warning(f"SRT: Pacer exited early ({elapsed:.1f}s), attempting restart")
@@ -706,16 +720,16 @@ class HandlerSRTOutput(HandlerBase):
                     context.session.reset()
                     context.session = None
             
-            # 检查 pacer 线程是否正在启动中（避免竞态条件）
+            # 检查 pacer 是否正在启动中（避免竞态条件）
             elif context.session._pacer_thread is not None and context.session._pacer_start_time > 0:
                 elapsed = time.time() - context.session._pacer_start_time
-                if elapsed < 3.0 and context.session.frame_count == 0:
+                if elapsed < 5.0:  # 延长启动保护时间到5秒
                     # 线程刚启动，还在初始化阶段，不要打扰
                     logger.debug(f"SRT: Pacer thread starting up ({elapsed:.2f}s), skipping check")
                     return context.session
             
             # 检查 pacer 是否卡死（线程活着但 frame_count=0 超过 35 秒）
-            elif context.session.frame_count == 0 and context.session._pacer_start_time > 0:
+            elif context.session._pacer_start_time > 0:
                 stuck_duration = time.time() - context.session._pacer_start_time
                 if stuck_duration > 35.0:
                     logger.error(f"SRT: Pacer stuck for {stuck_duration:.0f}s with 0 frames, resetting session")
@@ -724,10 +738,6 @@ class HandlerSRTOutput(HandlerBase):
                     context.session = None
             
             else:
-                # 运行正常，重置失败计数
-                if context._fail_count > 0 and context.session.frame_count > 10:
-                    logger.info("SRT: ffmpeg 运行正常，重置重试计数")
-                    context._fail_count = 0
                 return context.session
 
         # 重试冷却检查（指数退避：5, 10, 20, 40, 60s）
