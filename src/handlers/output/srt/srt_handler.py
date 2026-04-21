@@ -290,6 +290,8 @@ class HandlerSRTOutput(HandlerBase):
             # 造成永久性音视频偏移
             audio_wait_start = time.time()
             audio_ready = False
+            audio_timeout = False
+            buffer_ready = False
             
             while not session._pacer_quit.is_set():
                 if session._audio_ready.wait(timeout=0.5):
@@ -304,17 +306,29 @@ class HandlerSRTOutput(HandlerBase):
                     retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else -1
                     logger.error(f"[SYNC] Pacer: ffmpeg exited before audio ready (code={retcode})")
                     return
-                # 30 秒超时：如果音频连接 30 秒还没建立，放弃本次尝试
-                if elapsed > 30.0:
-                    logger.error("[SYNC] Pacer: Audio connection not ready after 30s, giving up")
-                    return
+                # 检查音频缓冲是否已有足够数据（至少1帧）
+                with session._audio_buffer_lock:
+                    if len(session._audio_buffer) >= audio_bytes_per_frame:
+                        buffer_ready = True
+                        logger.info(f"[SYNC] Pacer: Audio buffer has {len(session._audio_buffer)} bytes, starting")
+                        break
+                # 10 秒超时：如果音频连接 10 秒还没建立，用静音继续运行
+                if elapsed > 10.0:
+                    logger.warning("[SYNC] Pacer: Audio connection timeout after 10s, continuing with silence")
+                    audio_timeout = True
+                    break
             
-            # 明确区分退出原因
-            if not audio_ready:
+            # 检查是否收到退出信号
+            if session._pacer_quit.is_set():
                 logger.error("[SYNC] Pacer: Quit signal received while waiting for audio connection")
                 return
             
-            logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+            if audio_ready:
+                logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+            elif buffer_ready:
+                logger.info("[SYNC] Pacer: Starting with buffered audio data")
+            elif audio_timeout:
+                logger.info("[SYNC] Pacer: Starting with audio timeout (will use silence)")
 
             logger.info(f"[SYNC] Pacer started: {fps}fps, {samples_per_frame} samples/frame, "
                        f"{frame_duration*1000:.0f}ms/frame")
@@ -438,11 +452,13 @@ class HandlerSRTOutput(HandlerBase):
                     writer = session.audio_writer
 
                 if writer is None:
-                    # 音频连接断开，不能只写视频不写音频（否则 ffmpeg PTS 偏移）
-                    # 跳过本 tick，等待音频连接恢复
-                    # 不递增 tick，让时间基准自然对齐
-                    session._last_video_bytes = video_bytes
-                    continue
+                    # 音频连接断开，检查是否允许静音模式继续运行
+                    if not audio_timeout and not buffer_ready:
+                        # 正常情况下，音频连接断开时不写数据，等待恢复
+                        session._last_video_bytes = video_bytes
+                        continue
+                    # audio_timeout 或 buffer_ready 模式：用静音继续运行
+                    writer = None  # 标记为静音模式
 
                 # 6. 取音频数据（此时 writer 一定不为 None）
                 audio_bytes = None
@@ -479,14 +495,19 @@ class HandlerSRTOutput(HandlerBase):
                     pass
 
                 # 9. 写入音频 (TCP/FIFO)
-                try:
-                    with session.audio_write_lock:
-                        if isinstance(writer, socket.socket):
-                            writer.sendall(audio_bytes)
-                        elif isinstance(writer, int):
-                            os.write(writer, audio_bytes)
-                except (BrokenPipeError, OSError, ConnectionError):
-                    pass  # 下一个 tick 会检测到 writer 变化
+                if writer is not None:
+                    try:
+                        with session.audio_write_lock:
+                            if isinstance(writer, socket.socket):
+                                writer.sendall(audio_bytes)
+                            elif isinstance(writer, int):
+                                os.write(writer, audio_bytes)
+                    except (BrokenPipeError, OSError, ConnectionError):
+                        pass  # 下一个 tick 会检测到 writer 变化
+                else:
+                    # 静音模式：不写入音频，但视频继续写
+                    # ffmpeg 会自动处理缺失的音频（可能产生静音）
+                    pass
 
                 # 10. 更新状态
                 session.frame_count += 1
