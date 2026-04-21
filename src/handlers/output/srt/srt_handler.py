@@ -308,10 +308,13 @@ class HandlerSRTOutput(HandlerBase):
                     return
                 # 检查音频缓冲是否已有足够数据（至少1帧）
                 with session._audio_buffer_lock:
-                    if len(session._audio_buffer) >= audio_bytes_per_frame:
+                    buf_len = len(session._audio_buffer)
+                    if buf_len >= audio_bytes_per_frame:
                         buffer_ready = True
-                        logger.info(f"[SYNC] Pacer: Audio buffer has {len(session._audio_buffer)} bytes, starting")
+                        logger.info(f"[SYNC] Pacer: Audio buffer has {buf_len} bytes ({buf_len / 4 / sample_rate:.2f}s), starting")
                         break
+                    else:
+                        logger.debug(f"[SYNC] Pacer: Audio buffer has {buf_len} bytes, waiting...")
                 # 10 秒超时：如果音频连接 10 秒还没建立，用静音继续运行
                 if elapsed > 10.0:
                     logger.warning("[SYNC] Pacer: Audio connection timeout after 10s, continuing with silence")
@@ -484,7 +487,12 @@ class HandlerSRTOutput(HandlerBase):
                     logger.error("[SYNC] Pacer: Video writer encountered error, stopping")
                     break
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
-                    logger.error("[SYNC] Pacer: ffmpeg 进程已退出")
+                    retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else -1
+                    logger.error(f"[SYNC] Pacer: ffmpeg 进程已退出 (code={retcode})")
+                    break
+                # 检查退出信号
+                if session._pacer_quit.is_set():
+                    logger.error("[SYNC] Pacer: 收到退出信号，停止运行")
                     break
 
                 # 8. 投递视频帧到写线程（非阻塞）
@@ -526,7 +534,9 @@ class HandlerSRTOutput(HandlerBase):
                                f"video_dur={video_dur:.1f}s audio_dur={audio_dur:.1f}s "
                                f"video_q={vq_len} audio_buf={buf_len}")
 
-            logger.info("[SYNC] Pacer loop ended, cleaning up video writer thread")
+            logger.info(f"[SYNC] Pacer loop ended, frame_count={session.frame_count}, "
+                       f"audio_sample_count={session.audio_sample_count}, "
+                       f"last_video_bytes={len(session._last_video_bytes) if session._last_video_bytes else 0}")
             # 停止视频写线程
             try:
                 video_write_queue.put(None, timeout=1.0)
@@ -568,14 +578,23 @@ class HandlerSRTOutput(HandlerBase):
                 fd = os.open(audio_fifo, os.O_WRONLY)
                 with session.state_lock:
                     session.audio_writer = fd
-                    dropped_chunks = len(session._pre_connect_audio_buffer)
-                    dropped_bytes = sum(len(b) for b in session._pre_connect_audio_buffer)
-                    session._pre_connect_audio_buffer.clear()
-                if dropped_chunks > 0:
-                    logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，丢弃 {dropped_chunks} 块旧缓冲 "
-                               f"({dropped_bytes} bytes)")
+                
+                # 检查 pacer 是否已经在运行（通过 frame_count 判断）
+                if session.frame_count > 0:
+                    # pacer 已经在运行，不要清空缓冲
+                    logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，pacer 已运行 {session.frame_count} 帧")
                 else:
-                    logger.info("SRT: 音频 FIFO 已打开")
+                    # pacer 还没开始，清空预连接缓冲（这些数据可能太旧）
+                    with session.state_lock:
+                        dropped_chunks = len(session._pre_connect_audio_buffer)
+                        dropped_bytes = sum(len(b) for b in session._pre_connect_audio_buffer)
+                        session._pre_connect_audio_buffer.clear()
+                    if dropped_chunks > 0:
+                        logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，丢弃 {dropped_chunks} 块旧缓冲 "
+                                   f"({dropped_bytes} bytes)")
+                    else:
+                        logger.info("SRT: 音频 FIFO 已打开")
+                
                 session._audio_ready.set()
             except Exception as e:
                 logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
