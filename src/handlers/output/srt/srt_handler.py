@@ -282,16 +282,34 @@ class HandlerSRTOutput(HandlerBase):
         audio_bytes_per_frame = samples_per_frame * 4
 
         def pacer_loop():
-            logger.info(f"[SYNC] Pacer: Waiting for audio connection...")
-
-            # 等待音频连接就绪，确保音视频同时开始写入 ffmpeg
-            if not session._audio_ready.wait(timeout=10.0):
-                logger.warning("[SYNC] Pacer: Audio connection timeout (10s), starting without audio sync")
-            else:
+            # 等待音频连接，但不要无限等待
+            # 如果 SRS 不可用，ffmpeg 可能连不上 SRS 导致 TCP accept 不被触发
+            # 最多等 3 秒，之后先用静音开始，等音频连接后自动切换
+            if session._audio_ready.wait(timeout=3.0):
                 logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+            else:
+                logger.warning("[SYNC] Pacer: Audio not ready after 3s, starting with silence "
+                              "(will switch to real audio when connection established)")
 
             logger.info(f"[SYNC] Pacer started: {fps}fps, {samples_per_frame} samples/frame, "
                        f"{frame_duration*1000:.0f}ms/frame")
+
+            # 等待第一帧视频到达（避免空跑）
+            first_frame_wait = 0
+            while not session._pacer_quit.is_set():
+                with session._video_queue_lock:
+                    if session._video_queue:
+                        break
+                time.sleep(0.01)
+                first_frame_wait += 10
+                if first_frame_wait > 5000:  # 5s 超时
+                    logger.error("[SYNC] Pacer: No video frame received after 5s, stopping")
+                    return
+                # 检查 ffmpeg 进程
+                if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                    retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else -1
+                    logger.error(f"[SYNC] Pacer: ffmpeg exited before first frame (code={retcode})")
+                    return
 
             start_time = None
             tick = 0
@@ -631,8 +649,8 @@ class HandlerSRTOutput(HandlerBase):
                 session._video_queue.append(rgb_bytes)
                 q_len += 1
 
-            if session.frame_count == 0:
-                logger.info(f"[SYNC] SRT: First video frame queued ({len(rgb_bytes)} bytes, queue={q_len})")
+            if session.frame_count == 0 and q_len <= 3:
+                logger.info(f"[SYNC] SRT: Video frame queued ({len(rgb_bytes)} bytes, queue={q_len})")
 
             return True
 
@@ -675,8 +693,8 @@ class HandlerSRTOutput(HandlerBase):
             # 首次音频写入日志
             with session._audio_buffer_lock:
                 buf_samples = len(session._audio_buffer) // 4
-            if session.audio_sample_count == 0:
-                logger.info(f"[SYNC] SRT: First audio buffered, {len(audio_data)} samples, "
+            if session.audio_sample_count == 0 and buf_samples <= 2880:  # 只前3帧
+                logger.info(f"[SYNC] SRT: Audio buffered, {len(audio_data)} samples, "
                            f"total buffer={buf_samples} samples")
 
             # 如果 TCP/FIFO 还没连接，也暂存一份到 pre_connect buffer
