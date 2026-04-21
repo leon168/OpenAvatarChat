@@ -68,10 +68,10 @@ class XilingSessionDelegate(ClientSessionDelegate):
         if self.data_submitter is None:
             return
 
-        definition = self.input_data_definitions.get(EngineChannelType.TEXT)
-        if definition is None:
-            logger.warning("XilingSessionDelegate: no TEXT definition, cannot submit text")
-            return
+        # 直接创建文本定义，不依赖 input_data_definitions
+        definition = DataBundleDefinition()
+        definition.add_entry(DataBundleEntry.create_text_entry("avatar_text"))
+        definition.lockdown()
 
         data_bundle = DataBundle(definition)
         data_bundle.set_main_data(text)
