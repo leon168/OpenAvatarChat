@@ -91,6 +91,8 @@ class SRTSession:
     _pacer_quit: threading.Event = field(default_factory=threading.Event)
     # 最后一帧的 RGB 数据（用于丢帧时补写，保持时间线连续）
     _last_video_bytes: Optional[bytes] = None
+    # pacer 启动时间（用于检测卡死）
+    _pacer_start_time: float = 0.0
     # 启动前的音频缓冲（TCP/FIFO 未连接时暂存）
     _pre_connect_audio_buffer: list = field(default_factory=list)
 
@@ -283,16 +285,26 @@ class HandlerSRTOutput(HandlerBase):
         audio_bytes_per_frame = samples_per_frame * 4
 
         def pacer_loop():
-            # 必须等待音频连接就绪才能开始
-            # 如果在音频未就绪时写视频，ffmpeg 的视频 PTS 会推进但音频 PTS 不动，
-            # 造成永久性音视频偏移（这是之前声音落后3秒的根因）
+            # 等待音频连接就绪
+            # 必须等音频就绪后才开始写数据，否则 ffmpeg 视频 PTS 领先音频 PTS，
+            # 造成永久性音视频偏移
+            audio_wait_start = time.time()
             while not session._pacer_quit.is_set():
                 if session._audio_ready.wait(timeout=0.5):
                     logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
                     break
+                elapsed = time.time() - audio_wait_start
+                # 每 2 秒报告一次状态
+                if int(elapsed * 2) % 2 == 0 and int((elapsed - 0.5) * 2) % 2 != 0:
+                    logger.warning(f"[SYNC] Pacer: Still waiting for audio connection ({elapsed:.0f}s)")
                 # 检查 ffmpeg 是否还在运行
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
-                    logger.error("[SYNC] Pacer: ffmpeg exited before audio connection ready")
+                    retcode = session.ffmpeg_process.poll() if session.ffmpeg_process else -1
+                    logger.error(f"[SYNC] Pacer: ffmpeg exited before audio ready (code={retcode})")
+                    return
+                # 30 秒超时：如果音频连接 30 秒还没建立，放弃本次尝试
+                if elapsed > 30.0:
+                    logger.error("[SYNC] Pacer: Audio connection not ready after 30s, giving up")
                     return
             else:
                 logger.error("[SYNC] Pacer: Quit signal while waiting for audio")
@@ -498,6 +510,7 @@ class HandlerSRTOutput(HandlerBase):
             logger.info("[SYNC] Pacer stopped")
 
         thread = threading.Thread(target=pacer_loop, daemon=True, name="srt-sync-pacer")
+        session._pacer_start_time = time.time()
         thread.start()
         session._pacer_thread = thread
 
@@ -624,6 +637,14 @@ class HandlerSRTOutput(HandlerBase):
                 self._record_failure(context)
                 context.session.reset()
                 context.session = None
+            # 检查 pacer 是否卡死（线程活着但 frame_count=0 超过 35 秒）
+            elif context.session.frame_count == 0 and context.session._pacer_start_time > 0:
+                stuck_duration = time.time() - context.session._pacer_start_time
+                if stuck_duration > 35.0:
+                    logger.error(f"SRT: Pacer stuck for {stuck_duration:.0f}s with 0 frames, resetting session")
+                    self._record_failure(context)
+                    context.session.reset()
+                    context.session = None
             else:
                 # 运行正常，重置失败计数
                 if context._fail_count > 0 and context.session.frame_count > 10:
