@@ -152,16 +152,7 @@ class XilingSessionDelegate(ClientSessionDelegate):
                     break
 
     def submit_text(self, text: str, stream_id: Optional[str] = None) -> ChatData:
-        """
-        提交文本到引擎
-
-        Args:
-            text: 要提交的文本
-            stream_id: 可选的流ID
-
-        Returns:
-            创建的 ChatData
-        """
+        """提交文本到引擎（作为 HUMAN_TEXT，需经 LLM 转换）"""
         definition = DataBundleDefinition()
         definition.add_entry(DataBundleEntry.create_text_entry("human_text"))
         definition.lockdown()
@@ -176,14 +167,6 @@ class XilingSessionDelegate(ClientSessionDelegate):
             is_last_data=True,
         )
 
-        if stream_id:
-            from chat_engine.data_models.chat_stream import ChatStreamIdentity
-            chat_data.stream_id = ChatStreamIdentity(
-                stream_key_str=stream_id,
-                data_type=ChatDataType.HUMAN_TEXT,
-                producer_name="xiling_ws"
-            )
-
         if self.data_submitter:
             self.data_submitter.submit(chat_data, finish_stream=True)
 
@@ -191,18 +174,7 @@ class XilingSessionDelegate(ClientSessionDelegate):
 
     def submit_audio(self, audio_data: np.ndarray, sample_rate: int = 16000,
                      is_last: bool = False, stream_id: Optional[str] = None) -> ChatData:
-        """
-        提交音频到引擎（直接驱动数字人）
-
-        Args:
-            audio_data: 音频数据 (int16 数组)
-            sample_rate: 采样率
-            is_last: 是否是最后一段音频
-            stream_id: 可选的流ID
-
-        Returns:
-            创建的 ChatData
-        """
+        """提交音频到引擎（直接驱动数字人）"""
         definition = DataBundleDefinition()
         definition.add_entry(DataBundleEntry.create_audio_entry(
             "avatar_audio",
@@ -220,14 +192,6 @@ class XilingSessionDelegate(ClientSessionDelegate):
             data=bundle,
             is_last_data=is_last,
         )
-
-        if stream_id:
-            from chat_engine.data_models.chat_stream import ChatStreamIdentity
-            chat_data.stream_id = ChatStreamIdentity(
-                stream_key_str=stream_id,
-                data_type=ChatDataType.AVATAR_AUDIO,
-                producer_name="xiling_ws"
-            )
 
         if self.data_submitter:
             self.data_submitter.submit(chat_data, finish_stream=is_last)

@@ -33,6 +33,7 @@ from chat_engine.data_models.chat_data_type import ChatDataType
 from chat_engine.data_models.chat_engine_config_data import HandlerBaseConfigModel, ChatEngineConfigModel
 from chat_engine.data_models.chat_signal import ChatSignal
 from chat_engine.data_models.chat_signal_type import ChatSignalType, ChatSignalSourceType
+from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.engine_channel_type import EngineChannelType
 from chat_engine.data_models.runtime_data.data_bundle import DataBundleDefinition, DataBundleEntry, VariableSize
 
@@ -117,7 +118,7 @@ class XilingWsHandler(ClientHandlerBase):
         ))
         audio_input_definition.lockdown()
         self.input_bundle_definitions[EngineChannelType.AUDIO] = audio_input_definition
-        
+
         # 音频输出定义 (发送到客户端)
         audio_output_definition = DataBundleDefinition()
         audio_output_definition.add_entry(DataBundleEntry.create_audio_entry(
@@ -127,7 +128,7 @@ class XilingWsHandler(ClientHandlerBase):
         ))
         audio_output_definition.lockdown()
         self.output_bundle_definitions[EngineChannelType.AUDIO] = audio_output_definition
-        
+
         # 视频输出定义
         video_output_definition = DataBundleDefinition()
         video_output_definition.add_entry(DataBundleEntry.create_framed_entry(
@@ -138,6 +139,12 @@ class XilingWsHandler(ClientHandlerBase):
         ))
         video_output_definition.lockdown()
         self.output_bundle_definitions[EngineChannelType.VIDEO] = video_output_definition
+
+        # 文本输出定义 (text drive: 客户端文本直接驱动 TTS)
+        text_output_definition = DataBundleDefinition()
+        text_output_definition.add_entry(DataBundleEntry.create_text_entry("avatar_text"))
+        text_output_definition.lockdown()
+        self.output_bundle_definitions[EngineChannelType.TEXT] = text_output_definition
     
     def on_setup_app(self, app, ui, parent_block):
         """注册 WebSocket 路由"""
@@ -332,7 +339,7 @@ class XilingWsHandler(ClientHandlerBase):
             
             # 提交到会话
             if connection.session_delegate:
-                connection.session_delegate.put_audio_data(audio_array, self.config.sample_rate)
+                connection.session_delegate.submit_audio(audio_array, self.config.sample_rate)
                 
         except Exception as e:
             logger.error(f"Handle binary message error: {e}")
@@ -406,7 +413,7 @@ class XilingWsHandler(ClientHandlerBase):
             # 处理剩余音频数据
             if len(connection.audio_buffer) > 0 and connection.session_delegate:
                 audio_array = np.frombuffer(connection.audio_buffer, dtype=np.int16)
-                connection.session_delegate.put_audio_data(
+                connection.session_delegate.submit_audio(
                     audio_array, self.config.sample_rate, is_last=True
                 )
             
@@ -519,9 +526,11 @@ class XilingWsHandler(ClientHandlerBase):
                                   session_delegate: ClientSessionDelegate):
         """设置会话委托"""
         if isinstance(session_delegate, XilingSessionDelegate):
+            session_delegate.session_id = session_context.session_info.session_id
             session_delegate.clock = session_context.get_clock()
             session_delegate.data_submitter = handler_context.data_submitter
             session_delegate.signal_emitter = handler_context.signal_emitter
+            session_delegate.input_data_definitions = self.input_bundle_definitions
             session_delegate.shared_states = session_context.shared_states
     
     def create_context(self, session_context: SessionContext,
@@ -541,7 +550,8 @@ class XilingWsHandler(ClientHandlerBase):
             ChatDataType.AVATAR_VIDEO: HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
         }
 
-        _no_link = {"cancelable": False, "auto_link_input": False}
+        _no_link = ChatStreamConfig(cancelable=False, auto_link_input=False)
+        _tts_text = ChatStreamConfig(cancelable=True)
         outputs = {
             ChatDataType.MIC_AUDIO: HandlerDataInfo(
                 type=ChatDataType.MIC_AUDIO,
@@ -551,7 +561,7 @@ class XilingWsHandler(ClientHandlerBase):
             ChatDataType.AVATAR_TEXT: HandlerDataInfo(
                 type=ChatDataType.AVATAR_TEXT,
                 definition=self.output_bundle_definitions.get(EngineChannelType.TEXT),
-                output_stream_config=_no_link,
+                output_stream_config=_tts_text,
             ),
         }
 
