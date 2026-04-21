@@ -115,7 +115,15 @@ class HandlerTTSXiling(HandlerBase):
             
         self.access_token = self.config.access_token
         
-        logger.info(f"Xiling TTS loaded, per={self.config.per}, sample_rate={self.config.sample_rate}")
+        # 检查认证配置
+        if self.config.auth_type == "api_key" and not self.config.api_key:
+            logger.warning("Xiling TTS: api_key 为空，语音合成将失败！请配置 api_key 或设置环境变量 XILING_API_KEY")
+        elif self.config.auth_type == "access_token" and not self.config.access_token:
+            if not self.config.api_key or not self.config.secret_key:
+                logger.warning("Xiling TTS: access_token 和 api_key/secret_key 均为空，语音合成将失败！")
+        
+        logger.info(f"Xiling TTS loaded, per={self.config.per}, sample_rate={self.config.sample_rate}, "
+                   f"auth_type={self.config.auth_type}")
     
     async def _get_access_token(self) -> str:
         """使用 API Key 和 Secret Key 获取 access_token
@@ -447,8 +455,11 @@ class HandlerTTSXiling(HandlerBase):
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
         """处理输入数据"""
         context = cast(XilingTTSContext, context)
-        
+
         if inputs.type == ChatDataType.AVATAR_TEXT:
+            text_data = inputs.data.get_main_data() if inputs.data else None
+            logger.info(f"Xiling TTS handle: 收到文本输入, text={str(text_data)[:50] if text_data else 'None'}")
+
             # 使用事件循环运行异步处理
             try:
                 loop = asyncio.get_event_loop()
