@@ -289,9 +289,11 @@ class HandlerSRTOutput(HandlerBase):
             # 必须等音频就绪后才开始写数据，否则 ffmpeg 视频 PTS 领先音频 PTS，
             # 造成永久性音视频偏移
             audio_wait_start = time.time()
+            audio_ready = False
+            
             while not session._pacer_quit.is_set():
                 if session._audio_ready.wait(timeout=0.5):
-                    logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+                    audio_ready = True
                     break
                 elapsed = time.time() - audio_wait_start
                 # 每 2 秒报告一次状态
@@ -306,9 +308,13 @@ class HandlerSRTOutput(HandlerBase):
                 if elapsed > 30.0:
                     logger.error("[SYNC] Pacer: Audio connection not ready after 30s, giving up")
                     return
-            else:
-                logger.error("[SYNC] Pacer: Quit signal while waiting for audio")
+            
+            # 明确区分退出原因
+            if not audio_ready:
+                logger.error("[SYNC] Pacer: Quit signal received while waiting for audio connection")
                 return
+            
+            logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
 
             logger.info(f"[SYNC] Pacer started: {fps}fps, {samples_per_frame} samples/frame, "
                        f"{frame_duration*1000:.0f}ms/frame")
@@ -631,12 +637,35 @@ class HandlerSRTOutput(HandlerBase):
 
     def _ensure_session(self, context: SRTOutputContext) -> Optional[SRTSession]:
         if context.session is not None and context.session.is_running:
-            # 检查节奏器线程是否存活
-            if context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
-                logger.error("SRT: Sync pacer thread died, resetting session")
+            # 检查 ffmpeg 进程是否还在运行
+            if context.session.ffmpeg_process is not None and context.session.ffmpeg_process.poll() is not None:
+                retcode = context.session.ffmpeg_process.poll()
+                logger.error(f"SRT: ffmpeg process crashed with code {retcode}, resetting session")
                 self._record_failure(context)
                 context.session.reset()
                 context.session = None
+            
+            # 检查节奏器线程是否存活
+            elif context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
+                # 检查是否是因为等待音频连接而早期退出
+                if context.session.frame_count == 0 and context.session._pacer_start_time > 0:
+                    elapsed = time.time() - context.session._pacer_start_time
+                    if elapsed < 10.0:  # 启动后10秒内退出，可能是音频连接问题
+                        logger.warning(f"SRT: Pacer exited early ({elapsed:.1f}s), attempting restart")
+                        # 不记录失败，直接重试
+                        context.session.reset()
+                        context.session = None
+                    else:
+                        logger.error("SRT: Sync pacer thread died unexpectedly")
+                        self._record_failure(context)
+                        context.session.reset()
+                        context.session = None
+                else:
+                    logger.error("SRT: Sync pacer thread died, resetting session")
+                    self._record_failure(context)
+                    context.session.reset()
+                    context.session = None
+            
             # 检查 pacer 是否卡死（线程活着但 frame_count=0 超过 35 秒）
             elif context.session.frame_count == 0 and context.session._pacer_start_time > 0:
                 stuck_duration = time.time() - context.session._pacer_start_time
@@ -645,6 +674,7 @@ class HandlerSRTOutput(HandlerBase):
                     self._record_failure(context)
                     context.session.reset()
                     context.session = None
+            
             else:
                 # 运行正常，重置失败计数
                 if context._fail_count > 0 and context.session.frame_count > 10:
