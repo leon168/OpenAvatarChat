@@ -58,8 +58,13 @@ class XilingTTSSession:
     audio_buffer: bytearray = field(default_factory=bytearray)
     
     def reset(self):
-        """重置会话"""
+        """重置会话（保留 WebSocket 连接以复用）"""
         self.cancelled = True
+        self.audio_buffer = bytearray()
+        # 不关闭 WebSocket，留待下次复用
+    
+    def close_websocket(self):
+        """关闭 WebSocket 连接"""
         if self.websocket is not None:
             try:
                 loop = asyncio.get_event_loop()
@@ -69,7 +74,6 @@ class XilingTTSSession:
                     loop.run_until_complete(self.websocket.close())
             except Exception:
                 try:
-                    import websockets
                     loop = asyncio.new_event_loop()
                     loop.run_until_complete(self.websocket.close())
                     loop.close()
@@ -85,6 +89,7 @@ class XilingTTSContext(HandlerContext):
         super().__init__(session_id)
         self.config: Optional[XilingTTSConfig] = None
         self.sessions: Dict[StreamKey, XilingTTSSession] = {}
+        self._cached_websocket: Optional[websockets.WebSocketClientProtocol] = None  # WebSocket 复用
         
     def _create_session(self, input_stream: ChatStreamIdentity) -> XilingTTSSession:
         return XilingTTSSession(input_stream_id=input_stream)
@@ -307,7 +312,7 @@ class HandlerTTSXiling(HandlerBase):
             # 新的输入流，取消旧的
             for old_key, old_session in list(context.sessions.items()):
                 logger.info(f"Xiling TTS: 取消旧会话 {old_key}")
-                old_session.reset()
+                old_session.close_websocket()
             context.sessions.clear()
             
             # 创建新会话
@@ -323,26 +328,46 @@ class HandlerTTSXiling(HandlerBase):
             )
             session.output_stream_key = output_stream_id.key
             
-                # 建立 WebSocket 连接
-            try:
-                session.websocket = await self._connect_websocket()
-            except Exception as e:
-                logger.error(f"Xiling TTS WebSocket 连接失败: {e}")
-                context.sessions.pop(input_stream_key, None)
-                return
+            # 尝试复用缓存的 WebSocket 连接
+            ws_reused = False
+            cached_ws = context._cached_websocket
+            if cached_ws is not None and not cached_ws.closed:
+                try:
+                    init_ok = await self._initialize_session(cached_ws)
+                    if init_ok:
+                        session.websocket = cached_ws
+                        context._cached_websocket = None
+                        ws_reused = True
+                        logger.info("[LATENCY] Xiling TTS: 复用 WebSocket 连接，跳过连接建立 (~250ms saved)")
+                except Exception as e:
+                    logger.warning(f"Xiling TTS: 复用连接初始化失败: {e}，重新连接")
+                    try:
+                        await cached_ws.close()
+                    except Exception:
+                        pass
+                    context._cached_websocket = None
             
-            # 初始化会话 (发送 system.start 并等待 system.started)
-            try:
-                init_ok = await self._initialize_session(session.websocket)
-            except Exception as e:
-                logger.error(f"Xiling TTS 初始化失败: {e}")
-                init_ok = False
+            if not ws_reused:
+                # 建立新的 WebSocket 连接
+                try:
+                    session.websocket = await self._connect_websocket()
+                except Exception as e:
+                    logger.error(f"Xiling TTS WebSocket 连接失败: {e}")
+                    context.sessions.pop(input_stream_key, None)
+                    return
+                
+                # 初始化会话 (发送 system.start 并等待 system.started)
+                try:
+                    init_ok = await self._initialize_session(session.websocket)
+                except Exception as e:
+                    logger.error(f"Xiling TTS 初始化失败: {e}")
+                    init_ok = False
 
-            if not init_ok:
-                logger.error("Xiling TTS: 初始化未成功，终止本次合成")
-                session.reset()
-                context.sessions.pop(input_stream_key, None)
-                return
+                if not init_ok:
+                    logger.error("Xiling TTS: 初始化未成功，终止本次合成")
+                    session.close_websocket()
+                    context.sessions.pop(input_stream_key, None)
+                    return
         
         text = data.data.get_main_data()
         text = self._filter_text(text)
@@ -378,13 +403,16 @@ class HandlerTTSXiling(HandlerBase):
                 # 接收剩余音频
                 await self._receive_audio(context, session, finish=True)
                 
-                # 清理会话
+                # 缓存 WebSocket 连接以供下次复用（节省 ~250ms 连接时间）
+                if session.websocket is not None and not session.websocket.closed:
+                    context._cached_websocket = session.websocket
+                    session.websocket = None
                 session.reset()
                 context.sessions.pop(input_stream_key, None)
                 
         except Exception as e:
             logger.error(f"Xiling TTS 处理失败: {e}")
-            session.reset()
+            session.close_websocket()
             context.sessions.pop(input_stream_key, None)
     
     async def _receive_audio(self, context: XilingTTSContext, session: XilingTTSSession, finish: bool = False):
@@ -500,14 +528,14 @@ class HandlerTTSXiling(HandlerBase):
             session = context.sessions.pop(stream_key, None)
             if session:
                 logger.info(f"Xiling TTS: 取消会话 {stream_key}")
-                session.reset()
+                session.close_websocket()
                 return
             
             # 检查输出流
             for key, session in list(context.sessions.items()):
                 if session.output_stream_key == stream_key:
                     logger.info(f"Xiling TTS: 取消输出流 {stream_key}")
-                    session.reset()
+                    session.close_websocket()
                     context.sessions.pop(key, None)
                     return
     
@@ -518,8 +546,18 @@ class HandlerTTSXiling(HandlerBase):
         
         for session in context.sessions.values():
             try:
-                session.reset()
+                session.close_websocket()
             except Exception as e:
                 logger.warning(f"重置会话失败: {e}")
+        
+        # 关闭缓存的 WebSocket
+        if context._cached_websocket is not None:
+            try:
+                loop = asyncio.new_event_loop()
+                loop.run_until_complete(context._cached_websocket.close())
+                loop.close()
+            except Exception:
+                pass
+            context._cached_websocket = None
         
         context.sessions.clear()

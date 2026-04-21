@@ -129,11 +129,13 @@ class AvatarProcessor:
         audio_slice = None
         self._audio2signal_speed_limiter.start()
         target_round_time = 0.9
+        first_slice = True
         while self._session_running:
             start_time = time.time()
             try:
                 audio_slice: AudioSlice = self._audio_slice_queue.get(timeout=0.1)
-                target_round_time = audio_slice.get_audio_duration() - 0.1
+                margin = 0.02 if not first_slice else 0
+                target_round_time = audio_slice.get_audio_duration() - margin
             except Exception:
                 continue
 
@@ -152,7 +154,7 @@ class AvatarProcessor:
 
             # remove front padding audio and relative frames
             front_padding_duration = audio_slice.front_padding_duration
-            target_round_time = audio_slice.get_audio_duration() - front_padding_duration - 0.1
+            target_round_time = audio_slice.get_audio_duration() - front_padding_duration - margin
             padding_frame_count = int(front_padding_duration * self._init_option.video_frame_rate)
             signal_vals = signal_vals[padding_frame_count:]
             padding_audio_count = int(front_padding_duration) * self._init_option.audio_sample_rate * 2
@@ -178,7 +180,10 @@ class AvatarProcessor:
                 self._signal_queue.put_nowait(middle_result)
             cost = time.time() - start_time
             sleep_time = target_round_time - cost
-            if sleep_time > 0:
+            if first_slice:
+                first_slice = False
+                logger.info("[LATENCY] audio2signal first slice processed in {:.0f}ms (no speed limit)".format(cost * 1000))
+            elif sleep_time > 0:
                 time.sleep(sleep_time)
         logger.debug("audio2signal loop stopped")
 
@@ -191,7 +196,7 @@ class AvatarProcessor:
         timestamp = 0
         
         # delay start to ensure no extra audio and video generated
-        time.sleep(0.5)
+        time.sleep(0.1)
         
         while self._session_running:
             if self._signal_queue.empty():

@@ -212,15 +212,11 @@ class HandlerSRTOutput(HandlerBase):
         return [
             config.ffmpeg_path,
             "-y", "-hide_banner", "-loglevel", "warning",
-            # Video input - use wallclock timestamps for sync
-            "-use_wallclock_as_timestamps", "1",
             "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{config.video_width}x{config.video_height}",
             "-r", str(config.fps),
             "-thread_queue_size", "512",
             "-i", "-",
-            # Audio input - use wallclock timestamps for sync
-            "-use_wallclock_as_timestamps", "1",
             "-f", "f32le", "-ar", str(config.audio_sample_rate), "-ac", "1",
             "-thread_queue_size", "512",
             "-i", audio_input,
@@ -338,20 +334,18 @@ class HandlerSRTOutput(HandlerBase):
         def open_audio_fifo():
             try:
                 fd = os.open(audio_fifo, os.O_WRONLY)
-                # 在锁内更新状态，锁外做 I/O
+                # 在锁内更新状态，丢弃旧缓冲（不刷给 ffmpeg，避免时间线偏移）
                 with session.state_lock:
                     session.audio_writer = fd
-                    buffers = list(session._audio_buffer)
+                    dropped_chunks = len(session._audio_buffer)
+                    dropped_bytes = sum(len(b) for b in session._audio_buffer)
                     session._audio_buffer.clear()
-                # 使用 audio_write_lock 防止与后续 _write_audio 并发写入
-                with session.audio_write_lock:
-                    for buf in buffers:
-                        try:
-                            os.write(fd, buf)
-                        except Exception:
-                            break
+                if dropped_chunks > 0:
+                    logger.info(f"[SYNC] SRT: 音频 FIFO 已打开，丢弃 {dropped_chunks} 块旧缓冲 "
+                               f"({dropped_bytes} bytes)，音视频从当前时间同步开始")
+                else:
+                    logger.info("SRT: 音频 FIFO 已打开")
                 session._audio_ready.set()
-                logger.info("SRT: 音频 FIFO 已打开")
             except Exception as e:
                 logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
                 session._audio_ready.set()
@@ -387,19 +381,18 @@ class HandlerSRTOutput(HandlerBase):
             try:
                 server_sock.settimeout(15)
                 conn, _ = server_sock.accept()
+                # 在锁内更新状态，丢弃旧缓冲（不刷给 ffmpeg，避免时间线偏移）
                 with session.state_lock:
                     session.audio_writer = conn
-                    buffers = list(session._audio_buffer)
+                    dropped_chunks = len(session._audio_buffer)
+                    dropped_bytes = sum(len(b) for b in session._audio_buffer)
                     session._audio_buffer.clear()
-                # 使用 audio_write_lock 防止与后续 _write_audio 并发写入
-                with session.audio_write_lock:
-                    for buf in buffers:
-                        try:
-                            conn.sendall(buf)
-                        except Exception:
-                            break
+                if dropped_chunks > 0:
+                    logger.info(f"[SYNC] SRT: 音频 TCP 连接已建立，丢弃 {dropped_chunks} 块旧缓冲 "
+                               f"({dropped_bytes} bytes)，音视频从当前时间同步开始")
+                else:
+                    logger.info("SRT: 音频 TCP 连接已建立")
                 session._audio_ready.set()
-                logger.info("SRT: 音频 TCP 连接已建立")
             except Exception as e:
                 logger.error(f"SRT: 等待音频 TCP 连接失败: {e}")
                 session._audio_ready.set()
@@ -530,8 +523,8 @@ class HandlerSRTOutput(HandlerBase):
 
         # 等待音频连接就绪再写入视频帧，确保音视频同步启动
         if session.frame_count == 0:
-            if not session._audio_ready.wait(timeout=10.0):
-                logger.warning("SRT: 音频连接未就绪，首帧视频已等待超时，先写入")
+            if not session._audio_ready.wait(timeout=3.0):
+                logger.warning("[SYNC] SRT: 音频连接未就绪(3s超时)，首帧视频先写入")
 
         try:
             rgb_bytes = self._prepare_video_frame(video_frame)

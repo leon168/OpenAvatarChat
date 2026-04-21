@@ -54,7 +54,7 @@ default:
         avatar_name: 20250408/sample_data
         fps: 25
         debug: false
-        enable_fast_mode: false
+        enable_fast_mode: true
         use_gpu: true
 
       # === SRT 直播输出 (推流到 SRS) ===
