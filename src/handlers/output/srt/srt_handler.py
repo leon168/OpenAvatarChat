@@ -13,6 +13,7 @@ SRT 推流输出 Handler
 
 import os
 import platform
+import queue
 import socket
 import subprocess
 import tempfile
@@ -315,6 +316,36 @@ class HandlerSRTOutput(HandlerBase):
             tick = 0
             silence_audio = b'\x00' * audio_bytes_per_frame  # 静音帧
             consecutive_silence = 0
+            # 视频写入队列：pacer 放入帧数据，视频写线程消费
+            # 避免 stdin.write(2.28MB) 阻塞 pacer 节奏控制
+            video_write_queue = queue.Queue(maxsize=5)
+            video_write_error = [False]  # 用 list 以便在闭包中修改
+
+            def video_writer():
+                """独立线程写视频帧到 ffmpeg stdin，避免阻塞 pacer"""
+                while not session._pacer_quit.is_set():
+                    try:
+                        item = video_write_queue.get(timeout=0.1)
+                        if item is None:
+                            break
+                        v_bytes, v_tick = item
+                        if video_write_error[0]:
+                            continue
+                        try:
+                            stdin = session.ffmpeg_process.stdin
+                            if stdin is not None:
+                                stdin.write(v_bytes)
+                        except BrokenPipeError:
+                            logger.error("[SYNC] Video writer: stdin pipe broken")
+                            video_write_error[0] = True
+                        except OSError as e:
+                            logger.error(f"[SYNC] Video writer: stdin error: {e}")
+                            video_write_error[0] = True
+                    except queue.Empty:
+                        continue
+
+            vw_thread = threading.Thread(target=video_writer, daemon=True, name="srt-video-writer")
+            vw_thread.start()
 
             while not session._pacer_quit.is_set():
                 # 1. 计算目标写入时间
@@ -369,24 +400,22 @@ class HandlerSRTOutput(HandlerBase):
                 else:
                     consecutive_silence = 0
 
-                # 5. 检查 ffmpeg 进程
+                # 5. 检查 ffmpeg 进程和视频写入错误
+                if video_write_error[0]:
+                    logger.error("[SYNC] Pacer: Video writer encountered error, stopping")
+                    break
                 if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
                     logger.error("[SYNC] Pacer: ffmpeg 进程已退出")
                     break
 
-                # 6. 写入视频 (stdin)
+                # 6. 投递视频帧到写线程（非阻塞）
                 try:
-                    stdin = session.ffmpeg_process.stdin
-                    if stdin is not None:
-                        stdin.write(video_bytes)
-                except BrokenPipeError:
-                    logger.error("[SYNC] Pacer: ffmpeg stdin pipe broken")
-                    break
-                except OSError as e:
-                    logger.error(f"[SYNC] Pacer: ffmpeg stdin write error: {e}")
-                    break
+                    video_write_queue.put_nowait((video_bytes, tick))
+                except queue.Full:
+                    # 写线程来不及消费，跳过这帧（用上一帧保持时间线）
+                    pass
 
-                # 7. 写入音频 (TCP/FIFO)
+                # 7. 写入音频 (TCP/FIFO) — 直接写，音频数据量小不会阻塞
                 with session.state_lock:
                     writer = session.audio_writer
 
@@ -419,6 +448,14 @@ class HandlerSRTOutput(HandlerBase):
                                f"drift={(video_dur-audio_dur)*1000:+.0f}ms "
                                f"video_q={q_len} audio_buf={buf_len}")
 
+            logger.info("[SYNC] Pacer loop ended, cleaning up video writer thread")
+            # 停止视频写线程
+            try:
+                video_write_queue.put(None, timeout=1.0)
+            except queue.Full:
+                pass
+            session._pacer_quit.set()
+            vw_thread.join(timeout=2.0)
             logger.info("[SYNC] Pacer stopped")
 
         thread = threading.Thread(target=pacer_loop, daemon=True, name="srt-sync-pacer")
