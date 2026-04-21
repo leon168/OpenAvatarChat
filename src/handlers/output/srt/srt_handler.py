@@ -81,6 +81,8 @@ class SRTSession:
     _video_writer_thread: Optional[threading.Thread] = None
     _video_writer_quit: threading.Event = field(default_factory=threading.Event)
     _video_drop_count: int = 0
+    # 最后一帧的 RGB 数据（用于丢帧时补写，保持时间线连续）
+    _last_video_bytes: Optional[bytes] = None
 
     def reset(self):
         """重置会话"""
@@ -148,6 +150,7 @@ class SRTSession:
             self.audio_sample_count = 0
             self.active_streams.clear()
             self._video_drop_count = 0
+            self._last_video_bytes = None
 
         # 清空队列
         while not self._video_queue.empty():
@@ -540,16 +543,23 @@ class HandlerSRTOutput(HandlerBase):
             if count <= 3:
                 logger.info(f"SRT: Queuing video frame #{count}, {len(rgb_bytes)} bytes")
 
-            # 非阻塞放入队列
+            # 非阻塞放入队列；队列满时补写上一帧副本以保持时间线连续
             try:
                 session._video_queue.put_nowait((rgb_bytes, count))
+                session._last_video_bytes = rgb_bytes
             except queue.Full:
-                # 队列满，丢弃当前帧（保持实时性）
+                # 队列满，用上一帧补写（保持 ffmpeg 时间线连续，避免丢帧压缩时间线导致音视频不同步）
+                last_bytes = session._last_video_bytes
+                if last_bytes is not None:
+                    try:
+                        session._video_queue.put_nowait((last_bytes, -count))
+                    except queue.Full:
+                        pass
                 session._video_drop_count += 1
-                if session._video_drop_count <= 3 or session._video_drop_count % 25 == 0:
-                    logger.warning(f"SRT: Video queue full, dropped frame #{count} "
-                                 f"(total dropped: {session._video_drop_count})")
-                return True  # 不终止会话，只是丢帧
+                if session._video_drop_count <= 3 or session._video_drop_count % 100 == 0:
+                    logger.warning(f"[SYNC] SRT: Video queue full, duplicated last frame for #{count} "
+                                 f"(total: {session._video_drop_count})")
+                return True
 
             # 检查写线程是否存活
             if session._video_writer_thread is not None and not session._video_writer_thread.is_alive():
@@ -642,9 +652,12 @@ class HandlerSRTOutput(HandlerBase):
             if vc > 0 and vc % 100 == 0:
                 audio_dur = session.audio_sample_count / (context.config.audio_sample_rate or 24000)
                 video_dur = vc / (context.config.fps or 25)
-                drift_ms = (video_dur - audio_dur) * 1000
-                logger.info(f"[SYNC] frame={vc} audio_samples={session.audio_sample_count} "
-                           f"video_dur={video_dur:.2f}s audio_dur={audio_dur:.2f}s drift={drift_ms:+.0f}ms")
+                # 实际写入的帧数 = 总帧数 - 丢帧数（丢帧用上一帧补写，时间线未压缩）
+                actual_written = vc - session._video_drop_count
+                actual_video_dur = actual_written / (context.config.fps or 25)
+                drift_ms = (actual_video_dur - audio_dur) * 1000
+                logger.info(f"[SYNC] frame={vc}(written={actual_written}) audio_samples={session.audio_sample_count} "
+                           f"video_dur={actual_video_dur:.2f}s audio_dur={audio_dur:.2f}s drift={drift_ms:+.0f}ms")
             if not self._write_video(session, video_frame):
                 self._record_failure(context)
                 session.reset()
