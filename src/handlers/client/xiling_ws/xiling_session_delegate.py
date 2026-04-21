@@ -63,13 +63,36 @@ class XilingSessionDelegate(ClientSessionDelegate):
         return (0, 16000)
 
     def put_text_data(self, text: str, stream_id: str):
-        """提交文本数据到引擎"""
+        """提交文本数据到引擎（作为 AVATAR_TEXT 直接驱动 TTS，无需 LLM）"""
         logger.info(f"XilingSessionDelegate.put_text_data: text={text[:50]}..., stream_id={stream_id}")
-        self.put_data(
-            modality=EngineChannelType.TEXT,
-            data=text,
-            timestamp=None
+        if self.data_submitter is None:
+            return
+
+        definition = self.input_data_definitions.get(EngineChannelType.TEXT)
+        if definition is None:
+            logger.warning("XilingSessionDelegate: no TEXT definition, cannot submit text")
+            return
+
+        data_bundle = DataBundle(definition)
+        data_bundle.set_main_data(text)
+
+        chat_data = ChatData(
+            source="xiling_ws",
+            type=ChatDataType.AVATAR_TEXT,
+            data=data_bundle,
+            timestamp=self.get_timestamp(),
+            is_last_data=True,
         )
+
+        if stream_id:
+            from chat_engine.data_models.chat_stream import ChatStreamIdentity
+            chat_data.stream_id = ChatStreamIdentity(
+                stream_key_str=stream_id,
+                data_type=ChatDataType.AVATAR_TEXT,
+                producer_name="xiling_ws"
+            )
+
+        self.data_submitter.submit(chat_data, finish_stream=True)
 
     def put_data(self, modality: EngineChannelType, data: Union[np.ndarray, str],
                  timestamp: Optional[Tuple[int, int]] = None,

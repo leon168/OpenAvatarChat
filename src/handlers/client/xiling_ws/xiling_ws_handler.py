@@ -540,7 +540,7 @@ class XilingWsHandler(ClientHandlerBase):
             ChatDataType.AVATAR_AUDIO: HandlerDataInfo(type=ChatDataType.AVATAR_AUDIO),
             ChatDataType.AVATAR_VIDEO: HandlerDataInfo(type=ChatDataType.AVATAR_VIDEO),
         }
-        
+
         _no_link = {"cancelable": False, "auto_link_input": False}
         outputs = {
             ChatDataType.MIC_AUDIO: HandlerDataInfo(
@@ -548,8 +548,13 @@ class XilingWsHandler(ClientHandlerBase):
                 definition=self.output_bundle_definitions.get(EngineChannelType.AUDIO),
                 output_stream_config=_no_link,
             ),
+            ChatDataType.AVATAR_TEXT: HandlerDataInfo(
+                type=ChatDataType.AVATAR_TEXT,
+                definition=self.output_bundle_definitions.get(EngineChannelType.TEXT),
+                output_stream_config=_no_link,
+            ),
         }
-        
+
         return HandlerDetail(inputs=inputs, outputs=outputs)
     
     def handle(self, context: HandlerContext, inputs: ChatData,
