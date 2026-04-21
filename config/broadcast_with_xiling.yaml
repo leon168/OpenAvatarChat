@@ -63,10 +63,10 @@ default:
         module: output/srt/srt_handler
         srt_url: "srt://127.0.0.1:10080?streamid=#!::r=live/avatar,m=publish"
         latency_ms: 120
-        video_width: 512
-        video_height: 512
+        video_width: 594
+        video_height: 1280
         fps: 25
-        video_bitrate: 2000
+        video_bitrate: 3000
         audio_sample_rate: 24000  # LiteAvatar 输出 24kHz
         audio_bitrate: 128
         preset: fast
