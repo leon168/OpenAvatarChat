@@ -68,7 +68,6 @@ class XilingSessionDelegate(ClientSessionDelegate):
         if self.data_submitter is None:
             return
 
-        # 直接创建文本定义，不依赖 input_data_definitions
         definition = DataBundleDefinition()
         definition.add_entry(DataBundleEntry.create_text_entry("avatar_text"))
         definition.lockdown()
@@ -83,14 +82,6 @@ class XilingSessionDelegate(ClientSessionDelegate):
             timestamp=self.get_timestamp(),
             is_last_data=True,
         )
-
-        if stream_id:
-            from chat_engine.data_models.chat_stream import ChatStreamIdentity
-            chat_data.stream_id = ChatStreamIdentity(
-                stream_key_str=stream_id,
-                data_type=ChatDataType.AVATAR_TEXT,
-                producer_name="xiling_ws"
-            )
 
         self.data_submitter.submit(chat_data, finish_stream=True)
 
