@@ -666,6 +666,14 @@ class HandlerSRTOutput(HandlerBase):
                     context.session.reset()
                     context.session = None
             
+            # 检查 pacer 线程是否正在启动中（避免竞态条件）
+            elif context.session._pacer_thread is not None and context.session._pacer_start_time > 0:
+                elapsed = time.time() - context.session._pacer_start_time
+                if elapsed < 3.0 and context.session.frame_count == 0:
+                    # 线程刚启动，还在初始化阶段，不要打扰
+                    logger.debug(f"SRT: Pacer thread starting up ({elapsed:.2f}s), skipping check")
+                    return context.session
+            
             # 检查 pacer 是否卡死（线程活着但 frame_count=0 超过 35 秒）
             elif context.session.frame_count == 0 and context.session._pacer_start_time > 0:
                 stuck_duration = time.time() - context.session._pacer_start_time
