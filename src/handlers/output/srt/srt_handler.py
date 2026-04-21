@@ -59,7 +59,7 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     tune: str = Field(default="zerolatency", description="x264 tune 参数")
     ffmpeg_path: str = Field(default="ffmpeg", description="ffmpeg 可执行文件路径")
     srt_url_env: str = Field(default="SRT_URL", description="SRT URL 环境变量名")
-    video_queue_size: int = Field(default=30, description="视频帧队列大小(帧数)")
+    video_queue_size: int = Field(default=5, description="视频帧队列大小(帧数)")
 
 
 @dataclass
@@ -283,14 +283,20 @@ class HandlerSRTOutput(HandlerBase):
         audio_bytes_per_frame = samples_per_frame * 4
 
         def pacer_loop():
-            # 等待音频连接，但不要无限等待
-            # 如果 SRS 不可用，ffmpeg 可能连不上 SRS 导致 TCP accept 不被触发
-            # 最多等 3 秒，之后先用静音开始，等音频连接后自动切换
-            if session._audio_ready.wait(timeout=3.0):
-                logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+            # 必须等待音频连接就绪才能开始
+            # 如果在音频未就绪时写视频，ffmpeg 的视频 PTS 会推进但音频 PTS 不动，
+            # 造成永久性音视频偏移（这是之前声音落后3秒的根因）
+            while not session._pacer_quit.is_set():
+                if session._audio_ready.wait(timeout=0.5):
+                    logger.info("[SYNC] Pacer: Audio connection ready, starting synced output")
+                    break
+                # 检查 ffmpeg 是否还在运行
+                if session.ffmpeg_process is None or session.ffmpeg_process.poll() is not None:
+                    logger.error("[SYNC] Pacer: ffmpeg exited before audio connection ready")
+                    return
             else:
-                logger.warning("[SYNC] Pacer: Audio not ready after 3s, starting with silence "
-                              "(will switch to real audio when connection established)")
+                logger.error("[SYNC] Pacer: Quit signal while waiting for audio")
+                return
 
             logger.info(f"[SYNC] Pacer started: {fps}fps, {samples_per_frame} samples/frame, "
                        f"{frame_duration*1000:.0f}ms/frame")
@@ -386,6 +392,7 @@ class HandlerSRTOutput(HandlerBase):
                 with session._video_queue_lock:
                     if session._video_queue:
                         video_bytes = session._video_queue.popleft()
+                    vq_len = len(session._video_queue)
 
                 if video_bytes is None:
                     # 没有视频帧，使用上一帧（保持时间线连续）
@@ -396,7 +403,30 @@ class HandlerSRTOutput(HandlerBase):
                     tick += 1
                     continue
 
-                # 4. 取音频数据
+                # 4. 音频缓冲区对齐：保持和视频队列同样长度
+                #    视频队列丢弃旧帧，音频缓冲区必须同步丢弃旧数据，
+                #    否则 pacer 会把旧音频配新视频 → 声音落后
+                with session._audio_buffer_lock:
+                    max_audio_bytes = (vq_len + 2) * audio_bytes_per_frame
+                    if len(session._audio_buffer) > max_audio_bytes:
+                        excess = len(session._audio_buffer) - max_audio_bytes
+                        # 按 audio_bytes_per_frame 对齐裁剪，避免截断采样
+                        excess = (excess // audio_bytes_per_frame) * audio_bytes_per_frame
+                        if excess > 0:
+                            del session._audio_buffer[:excess]
+
+                # 5. 检查音频写入器是否可用
+                with session.state_lock:
+                    writer = session.audio_writer
+
+                if writer is None:
+                    # 音频连接断开，不能只写视频不写音频（否则 ffmpeg PTS 偏移）
+                    # 跳过本 tick，等待音频连接恢复
+                    # 不递增 tick，让时间基准自然对齐
+                    session._last_video_bytes = video_bytes
+                    continue
+
+                # 6. 取音频数据（此时 writer 一定不为 None）
                 audio_bytes = None
                 with session._audio_buffer_lock:
                     if len(session._audio_buffer) >= audio_bytes_per_frame:
@@ -415,7 +445,7 @@ class HandlerSRTOutput(HandlerBase):
                 else:
                     consecutive_silence = 0
 
-                # 5. 检查 ffmpeg 进程和视频写入错误
+                # 7. 检查 ffmpeg 进程和视频写入错误
                 if video_write_error[0]:
                     logger.error("[SYNC] Pacer: Video writer encountered error, stopping")
                     break
@@ -423,55 +453,39 @@ class HandlerSRTOutput(HandlerBase):
                     logger.error("[SYNC] Pacer: ffmpeg 进程已退出")
                     break
 
-                # 6. 投递视频帧到写线程（非阻塞）
+                # 8. 投递视频帧到写线程（非阻塞）
                 try:
                     video_write_queue.put_nowait((video_bytes, tick))
                 except queue.Full:
-                    # 写线程来不及消费，跳过这帧（用上一帧保持时间线）
+                    # 写线程来不及消费，跳过这帧
                     pass
 
-                # 7. 写入音频 (TCP/FIFO) — 直接写，音频数据量小不会阻塞
-                with session.state_lock:
-                    writer = session.audio_writer
+                # 9. 写入音频 (TCP/FIFO)
+                try:
+                    with session.audio_write_lock:
+                        if isinstance(writer, socket.socket):
+                            writer.sendall(audio_bytes)
+                        elif isinstance(writer, int):
+                            os.write(writer, audio_bytes)
+                except (BrokenPipeError, OSError, ConnectionError):
+                    pass  # 下一个 tick 会检测到 writer 变化
 
-                if writer is not None:
-                    try:
-                        with session.audio_write_lock:
-                            if isinstance(writer, socket.socket):
-                                writer.sendall(audio_bytes)
-                            elif isinstance(writer, int):
-                                os.write(writer, audio_bytes)
-                    except (BrokenPipeError, OSError, ConnectionError):
-                        pass  # 音频写入失败不影响视频
-
-                # 8. 更新状态
+                # 10. 更新状态
                 session.frame_count += 1
                 session.audio_sample_count += samples_per_frame
                 session._last_video_bytes = video_bytes
                 tick += 1
 
-                # 9. 定期日志 + 音频缓冲区溢出检查
+                # 11. 定期日志
                 if session.frame_count == 1:
                     logger.info("[SYNC] Pacer: First synced frame+audio written to ffmpeg")
                 if session.frame_count % 500 == 0:
                     audio_dur = session.audio_sample_count / sample_rate
                     video_dur = session.frame_count / fps
-                    q_len = len(session._video_queue)
                     buf_len = len(session._audio_buffer)
                     logger.info(f"[SYNC] Pacer: frame={session.frame_count} "
                                f"video_dur={video_dur:.1f}s audio_dur={audio_dur:.1f}s "
-                               f"drift={(video_dur-audio_dur)*1000:+.0f}ms "
-                               f"video_q={q_len} audio_buf={buf_len}")
-
-                    # 音频堆积超过 2 秒时裁剪（防止音视频漂移）
-                    # 正常情况 audio_buf 应该接近 0（生产≈消费）
-                    max_allowed = sample_rate * 4 * 2  # 2 秒
-                    if buf_len > max_allowed:
-                        with session._audio_buffer_lock:
-                            excess = len(session._audio_buffer) - max_allowed
-                            del session._audio_buffer[:excess]
-                        logger.warning(f"[SYNC] Pacer: Audio buffer overflow, trimmed "
-                                      f"{excess / 4 / sample_rate:.2f}s of old audio")
+                               f"video_q={vq_len} audio_buf={buf_len}")
 
             logger.info("[SYNC] Pacer loop ended, cleaning up video writer thread")
             # 停止视频写线程
