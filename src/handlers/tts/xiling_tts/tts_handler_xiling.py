@@ -331,20 +331,26 @@ class HandlerTTSXiling(HandlerBase):
             # 尝试复用缓存的 WebSocket 连接
             ws_reused = False
             cached_ws = context._cached_websocket
-            if cached_ws is not None and not cached_ws.closed:
+            if cached_ws is not None:
                 try:
-                    init_ok = await self._initialize_session(cached_ws)
-                    if init_ok:
-                        session.websocket = cached_ws
-                        context._cached_websocket = None
-                        ws_reused = True
-                        logger.info("[LATENCY] Xiling TTS: 复用 WebSocket 连接，跳过连接建立 (~250ms saved)")
-                except Exception as e:
-                    logger.warning(f"Xiling TTS: 复用连接初始化失败: {e}，重新连接")
+                    from websockets.protocol import State
+                    ws_open = cached_ws.state == State.OPEN
+                except Exception:
+                    ws_open = not getattr(cached_ws, 'closed', True)
+                if ws_open:
                     try:
-                        await cached_ws.close()
-                    except Exception:
-                        pass
+                        init_ok = await self._initialize_session(cached_ws)
+                        if init_ok:
+                            session.websocket = cached_ws
+                            context._cached_websocket = None
+                            ws_reused = True
+                            logger.info("[LATENCY] Xiling TTS: 复用 WebSocket 连接，跳过连接建立 (~250ms saved)")
+                    except Exception as e:
+                        logger.warning(f"Xiling TTS: 复用连接初始化失败: {e}，重新连接")
+                        try:
+                            await cached_ws.close()
+                        except Exception:
+                            pass
                     context._cached_websocket = None
             
             if not ws_reused:
@@ -404,9 +410,15 @@ class HandlerTTSXiling(HandlerBase):
                 await self._receive_audio(context, session, finish=True)
                 
                 # 缓存 WebSocket 连接以供下次复用（节省 ~250ms 连接时间）
-                if session.websocket is not None and not session.websocket.closed:
-                    context._cached_websocket = session.websocket
-                    session.websocket = None
+                if session.websocket is not None:
+                    try:
+                        from websockets.protocol import State
+                        ws_open = session.websocket.state == State.OPEN
+                    except Exception:
+                        ws_open = not getattr(session.websocket, 'closed', True)
+                    if ws_open:
+                        context._cached_websocket = session.websocket
+                        session.websocket = None
                 session.reset()
                 context.sessions.pop(input_stream_key, None)
                 
