@@ -236,8 +236,14 @@ class XilingWsHandler(ClientHandlerBase):
             await self._close_connection(connection_id)
     
     async def _create_session(self, connection: XilingConnection) -> Optional[XilingSessionDelegate]:
-        """创建会话"""
+        """创建或复用会话"""
         try:
+            # 先尝试复用已有 session（persist_session 场景下重连）
+            existing = self.handler_delegate.find_session_delegate(connection.live_room)
+            if existing is not None:
+                logger.info(f"Reusing existing session: {connection.live_room}")
+                return existing
+
             session_delegate = self.handler_delegate.start_session(
                 session_id=connection.live_room,
                 user_id=connection.app_id,
