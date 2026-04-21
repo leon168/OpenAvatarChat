@@ -45,7 +45,7 @@ class XilingTTSConfig(HandlerBaseConfigModel, BaseModel):
     pit: int = Field(default=5, description="音调，0-15，默认5")
     vol: int = Field(default=5, description="音量，基础音库取值0-9，其他音库取值 0-15，默认为 5")
     sample_rate: int = Field(default=16000, description="采样率，仅支持16000")
-    aue: int = Field(default=3, description="音频格式，3=mp3-16k/24k，4=pcm-16k/24k，5=pcm-8k，6=wav-16k/24k，默认为3")
+    aue: int = Field(default=4, description="音频格式，3=mp3，4=pcm-16k/24k，5=pcm-8k，6=wav，默认4(pcm，代码按 raw int16 处理)")
 
 
 @dataclass
@@ -62,9 +62,19 @@ class XilingTTSSession:
         self.cancelled = True
         if self.websocket is not None:
             try:
-                asyncio.create_task(self.websocket.close())
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    asyncio.create_task(self.websocket.close())
+                else:
+                    loop.run_until_complete(self.websocket.close())
             except Exception:
-                pass
+                try:
+                    import websockets
+                    loop = asyncio.new_event_loop()
+                    loop.run_until_complete(self.websocket.close())
+                    loop.close()
+                except Exception:
+                    pass
             self.websocket = None
 
 
@@ -305,7 +315,7 @@ class HandlerTTSXiling(HandlerBase):
             context.sessions[input_stream_key] = session
             
             # 创建输出流
-            streamer = self.data_submitter.get_streamer(ChatDataType.AVATAR_AUDIO)
+            streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_AUDIO)
             output_stream_id = streamer.new_stream(
                 sources=[session.input_stream_id],
                 name="xiling_tts",
@@ -323,9 +333,13 @@ class HandlerTTSXiling(HandlerBase):
             
             # 初始化会话 (发送 system.start 并等待 system.started)
             try:
-                await self._initialize_session(session)
+                init_ok = await self._initialize_session(session.websocket)
             except Exception as e:
                 logger.error(f"Xiling TTS 初始化失败: {e}")
+                init_ok = False
+
+            if not init_ok:
+                logger.error("Xiling TTS: 初始化未成功，终止本次合成")
                 session.reset()
                 context.sessions.pop(input_stream_key, None)
                 return
@@ -378,7 +392,7 @@ class HandlerTTSXiling(HandlerBase):
         if not session.websocket:
             return
         
-        streamer = self.data_submitter.get_streamer(ChatDataType.AVATAR_AUDIO)
+        streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_AUDIO)
         
         try:
             # 设置超时
