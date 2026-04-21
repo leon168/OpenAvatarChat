@@ -32,7 +32,7 @@ class SpeechAudioProcessor:
         if self._current_audio.speech_id != speech_audio.speech_id:
             # new speech, extend this to audio slice duration,
             # so that algo can start immediately
-            logger.info("generate first audio slice for speech {}", speech_audio.speech_id)
+            logger.debug("generate first audio slice for speech {}", speech_audio.speech_id)
             self._current_audio = speech_audio.model_copy()
             if self._enable_fast_mode:
                 audio_data = self._current_audio.audio_data
@@ -55,9 +55,12 @@ class SpeechAudioProcessor:
         else:
             self._extend_current_audio(speech_audio)
         
-        logger.info("input speech audio {}, end of speech {}, duration {:.3f}s, current audio length {}",
-                    speech_audio.speech_id, speech_audio.end_of_speech, speech_audio.get_audio_duration(),
-                    len(self._current_audio.audio_data))
+        # 只在 end_of_speech 或达到切片阈值时打印
+        if speech_audio.end_of_speech or self._current_audio.get_audio_duration() >= self._audio_slice_duration:
+            logger.debug("speech audio {}, end={}, dur={:.3f}s, accum={}",
+                        speech_audio.speech_id, speech_audio.end_of_speech,
+                        speech_audio.get_audio_duration(),
+                        len(self._current_audio.audio_data))
 
         output_audio_list = []
         while self._current_audio.get_audio_duration() >= self._audio_slice_duration:

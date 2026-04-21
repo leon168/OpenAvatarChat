@@ -26,13 +26,13 @@ class IntervalCounter:
             self._last_log_time = now
         if now - self._last_log_time > self._interval:
             if isinstance(self._total_counter, float):
-                logger.info(
+                logger.debug(
                     "[{}] total: {:.3f}, interval: {:.3f}, avg_per_second: {:.3f}",
                     self._name, self._total_counter, self._interval_counter,
                     self._total_counter / (now - self._start_time)
                 )
             else:
-                logger.info(
+                logger.debug(
                     "[{}] total: {}, interval: {}, avg_per_second: {:.3f}",
                     self._name, self._total_counter, self._interval_counter,
                     self._total_counter / (now - self._start_time)
@@ -63,7 +63,7 @@ class IntervalCounter:
                     print_obj[avg_key] = round(v / (now - self._start_time), 3)
                 else:
                     self._counter_dict[k] = 0
-            logger.info("[{}] {}", self._name, json.dumps(print_obj, indent=4))
+            logger.debug("[{}] {}", self._name, json.dumps(print_obj, indent=4))
             self._last_log_time = now
 
     def reset(self):

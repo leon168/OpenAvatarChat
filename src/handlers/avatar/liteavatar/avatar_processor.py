@@ -32,7 +32,7 @@ class AvatarProcessor:
         logger.remove()
         logger.add(sys.stdout, level='INFO')
 
-        logger.info("init avatar processor {}", init_option)
+        logger.debug("init avatar processor {}", init_option)
         self._output_handlers: List[AvatarOutputHandler] = []
         self._algo_adapter = algo_adapter
         self._init_option = init_option
@@ -78,7 +78,7 @@ class AvatarProcessor:
         self._callback_counter = IntervalCounter("avatar callback")
 
     def stop(self):
-        logger.info("stop avatar processor, totol session time {:.3f}",
+        logger.debug("stop avatar processor, totol session time {:.3f}",
                     time.time() - self._session_start_time)
         self._session_running = False
         self._callback_stop()
@@ -88,7 +88,7 @@ class AvatarProcessor:
             self._audio2signal_thread.join()
         if self._mouth2full_thread is not None:
             self._mouth2full_thread.join()
-        logger.info("avatar processor stopped")
+        logger.debug("avatar processor stopped")
 
     def add_audio(self, speech_audio: SpeechAudio):
         audio_slices = self._speech_audio_processor.get_speech_audio_slice(speech_audio)
@@ -124,7 +124,7 @@ class AvatarProcessor:
         """
         generate signal for signal2img
         """
-        logger.info("audio2signal loop started")
+        logger.debug("audio2signal loop started")
         speech_id = ""
         audio_slice = None
         self._audio2signal_speed_limiter.start()
@@ -180,13 +180,13 @@ class AvatarProcessor:
             sleep_time = target_round_time - cost
             if sleep_time > 0:
                 time.sleep(sleep_time)
-        logger.info("audio2signal loop stopped")
+        logger.debug("audio2signal loop stopped")
 
     def _signal2img_loop(self):
         """
         generate image and do callbacks
         """
-        logger.info("signal2img loop started")
+        logger.debug("signal2img loop started")
         start_time = -1
         timestamp = 0
         
@@ -235,10 +235,14 @@ class AvatarProcessor:
                 if wait > 0:
                     time.sleep(wait)
 
-        logger.info("signal2img loop ended")
+        logger.debug("signal2img loop ended")
 
     def _mouth2full_loop(self):
-        logger.info("combine img loop started")
+        logger.debug("combine img loop started")
+        # sync tracking
+        _sync_audio_pts = 0
+        _sync_video_pts = 0
+        _sync_last_log_time = 0
         while self._session_running:
             try:
                 mouth_reusult: MouthResult = self._mouth_img_queue.get(timeout=0.1)
@@ -267,6 +271,7 @@ class AvatarProcessor:
                     speech_id=mouth_reusult.audio_slice.speech_id
                 )
                 self._callback_audio(audio_result)
+                _sync_audio_pts = self._current_audio_pts
                 logger.debug("create audio with duration {:.3f}s, status: {}",
                              mouth_reusult.audio_slice.get_audio_duration(), mouth_reusult.avatar_status)
             # create video result
@@ -289,12 +294,23 @@ class AvatarProcessor:
             )
 
             self._callback_image(image_result)
+            _sync_video_pts = self._current_video_pts
+
+            # [SYNC] 每秒打印一次音视频PTS差
+            now = time.time()
+            if now - _sync_last_log_time >= 1.0 and _sync_audio_pts > 0:
+                audio_dur = _sync_audio_pts / self._init_option.audio_sample_rate
+                video_dur = _sync_video_pts / self._init_option.video_frame_rate
+                drift_ms = (video_dur - audio_dur) * 1000
+                logger.info(f"[SYNC] avatar out: video_pts={_sync_video_pts} audio_pts={_sync_audio_pts} "
+                           f"video_dur={video_dur:.2f}s audio_dur={audio_dur:.2f}s drift={drift_ms:+.0f}ms")
+                _sync_last_log_time = now
             
             if self._callback_avatar_status != image_result.avatar_status and self._callback_avatar_status is not None:
                 self._callback_avatar_status_changed(mouth_reusult.speech_id, image_result.avatar_status)
             self._callback_avatar_status = image_result.avatar_status
             
-        logger.info("combine img loop ended")
+        logger.debug("combine img loop ended")
 
     def _reset_processor_status(self):
         self._audio_slice_queue = Queue()
@@ -312,7 +328,7 @@ class AvatarProcessor:
         self._speech_audio_aligner = SpeechAudioAligner(self._init_option.video_frame_rate, self._init_option.audio_sample_rate)
 
     def _init_algo(self):
-        logger.info("init algo")
+        logger.debug("init algo")
         self._algo_adapter.init(self._init_option)
 
     def _start_threads(self):

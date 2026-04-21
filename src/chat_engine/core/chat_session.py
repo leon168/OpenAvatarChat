@@ -42,7 +42,7 @@ class ChatSession:
         self.signal_manager = SignalManager(self.session_context.session_clock)
         self.signal_manager.init()
         self.stream_manager = StreamManager(self.signal_manager)
-        self.stream_manager.enable_debug_logging(True)
+        self.stream_manager.enable_debug_logging(False)
         self.data_sinks: Dict[ChatDataType, List[DataSink]] = {}
         self.handlers: Dict[str, HandlerRecord] = {}
         self._playback_begin_event_ids: Dict[str, str] = {}

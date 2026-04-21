@@ -251,7 +251,7 @@ class HandlerSRTOutput(HandlerBase):
                         continue
                     text = line.decode('utf-8', errors='ignore').strip()
                     if text:
-                        logger.warning(f"ffmpeg: {text}")
+                        logger.debug(f"ffmpeg: {text}")
                 except Exception:
                     break
         threading.Thread(target=read_stderr, daemon=True).start()
@@ -261,7 +261,6 @@ class HandlerSRTOutput(HandlerBase):
         session._video_writer_quit.clear()
 
         def writer_loop():
-            logger.info("SRT: Video writer thread started")
             while not session._video_writer_quit.is_set():
                 try:
                     item = session._video_queue.get(timeout=0.1)
@@ -282,8 +281,8 @@ class HandlerSRTOutput(HandlerBase):
                             break
                         stdin.write(rgb_bytes)
                         if count == 1:
-                            logger.info("SRT: First video frame written to ffmpeg stdin")
-                        if count % 25 == 0:
+                            logger.info("[SYNC] SRT: First video frame written to ffmpeg stdin")
+                        if count % 500 == 0:
                             logger.info(f"SRT: Sent {count} video frames")
                     except BrokenPipeError:
                         logger.error("SRT: ffmpeg stdin pipe broken (video writer thread)")
@@ -301,7 +300,7 @@ class HandlerSRTOutput(HandlerBase):
                 except queue.Empty:
                     break
 
-            logger.info("SRT: Video writer thread stopped")
+            logger.debug("SRT: Video writer thread stopped")
 
         thread = threading.Thread(target=writer_loop, daemon=True, name="srt-video-writer")
         thread.start()
@@ -313,7 +312,7 @@ class HandlerSRTOutput(HandlerBase):
         os.mkfifo(audio_fifo)
 
         command = self._build_ffmpeg_command(config, audio_fifo)
-        logger.info(f"Starting ffmpeg (FIFO): {' '.join(command)}")
+        logger.debug(f"Starting ffmpeg (FIFO): {' '.join(command)}")
 
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE,
@@ -351,7 +350,6 @@ class HandlerSRTOutput(HandlerBase):
                 session._audio_ready.set()
 
         threading.Thread(target=open_audio_fifo, daemon=True).start()
-        logger.info("SRT Output: ffmpeg 已启动 (FIFO 模式)")
         return session
 
     def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
@@ -363,7 +361,7 @@ class HandlerSRTOutput(HandlerBase):
 
         audio_url = f"tcp://127.0.0.1:{audio_port}"
         command = self._build_ffmpeg_command(config, audio_url)
-        logger.info(f"Starting ffmpeg (TCP): {' '.join(command)}")
+        logger.debug(f"Starting ffmpeg (TCP): {' '.join(command)}")
 
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE,
@@ -400,7 +398,6 @@ class HandlerSRTOutput(HandlerBase):
                 session._audio_ready.set()
 
         threading.Thread(target=accept_audio_connection, daemon=True).start()
-        logger.info("SRT Output: ffmpeg 已启动 (TCP 模式)")
         return session
 
     def _start_ffmpeg(self, config: SRTOutputConfig) -> SRTSession:
@@ -591,12 +588,16 @@ class HandlerSRTOutput(HandlerBase):
                 writer = session.audio_writer
                 if writer is not None:
                     session.audio_sample_count += len(audio_data)
+                    first_audio = session.audio_sample_count == len(audio_data)
                 else:
                     if len(session._audio_buffer) < 100:
                         session._audio_buffer.append(audio_bytes)
                     else:
-                        logger.warning("SRT: 音频缓冲已满，丢弃数据")
+                        logger.warning("[SYNC] SRT: 音频缓冲已满，丢弃数据")
                     return True
+
+            if first_audio:
+                logger.info(f"[SYNC] SRT: First audio written, {len(audio_data)} samples")
 
             # 锁外执行 I/O（使用 audio_write_lock 防止并发写入导致数据交错）
             with session.audio_write_lock:
@@ -623,17 +624,27 @@ class HandlerSRTOutput(HandlerBase):
 
         session = self._ensure_session(context)
         if session is None:
-            logger.error("SRT Output: 无法创建 ffmpeg 会话")
             return
 
         stream_id_str = f"{inputs.type.value}:{stream_key_str}"
         with session.state_lock:
             if stream_id_str not in session.active_streams:
                 session.active_streams.add(stream_id_str)
-                logger.info(f"SRT Output: 新流加入 {stream_id_str}, 活跃流: {session.active_streams}")
+                logger.info(f"[SYNC] SRT: 新流加入 {stream_id_str}")
+
+        now = time.time()
 
         if inputs.type == ChatDataType.AVATAR_VIDEO:
             video_frame = inputs.data.get_main_data()
+            with session.state_lock:
+                vc = session.frame_count
+            # 每100帧打印一次音视频计数差，用于检测漂移
+            if vc > 0 and vc % 100 == 0:
+                audio_dur = session.audio_sample_count / (context.config.audio_sample_rate or 24000)
+                video_dur = vc / (context.config.fps or 25)
+                drift_ms = (video_dur - audio_dur) * 1000
+                logger.info(f"[SYNC] frame={vc} audio_samples={session.audio_sample_count} "
+                           f"video_dur={video_dur:.2f}s audio_dur={audio_dur:.2f}s drift={drift_ms:+.0f}ms")
             if not self._write_video(session, video_frame):
                 self._record_failure(context)
                 session.reset()
@@ -650,9 +661,7 @@ class HandlerSRTOutput(HandlerBase):
                 with session.state_lock:
                     session.active_streams.discard(stream_id_str)
                     remaining = set(session.active_streams)
-                logger.info(f"SRT Output: 音频流结束, 剩余: {remaining}")
                 if not remaining:
-                    logger.info("SRT Output: 所有流结束，关闭会话")
                     session.reset()
                     context.session = None
 
