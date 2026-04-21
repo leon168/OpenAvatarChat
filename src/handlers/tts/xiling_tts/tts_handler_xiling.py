@@ -46,6 +46,11 @@ class XilingTTSConfig(HandlerBaseConfigModel, BaseModel):
     vol: int = Field(default=5, description="音量，基础音库取值0-9，其他音库取值 0-15，默认为 5")
     sample_rate: int = Field(default=16000, description="采样率，仅支持16000")
     aue: int = Field(default=4, description="音频格式，3=mp3，4=pcm-16k/24k，5=pcm-8k，6=wav，默认4(pcm，代码按 raw int16 处理)")
+    # 超时配置
+    connect_timeout: float = Field(default=10.0, description="WebSocket 连接超时时间（秒）")
+    init_timeout: float = Field(default=10.0, description="会话初始化超时时间（秒）")
+    audio_timeout: float = Field(default=10.0, description="音频数据接收超时时间（秒）")
+    audio_finish_timeout: float = Field(default=30.0, description="结束阶段音频接收超时时间（秒）")
 
 
 @dataclass
@@ -188,14 +193,22 @@ class HandlerTTSXiling(HandlerBase):
                 "Authorization": f"Bearer {self.config.api_key}"
             }
             url = f"{self.WS_URL}?{urlencode(params)}"
-            websocket = await websockets.connect(url, additional_headers=extra_headers)
+            # 添加连接超时
+            websocket = await asyncio.wait_for(
+                websockets.connect(url, additional_headers=extra_headers),
+                timeout=self.config.connect_timeout
+            )
             logger.info("Xiling TTS WebSocket 连接成功 (Authorization 鉴权)")
         else:
             # 鉴权令牌：使用 access_token URL 参数
             token = await self._get_access_token()
             params["access_token"] = token
             url = f"{self.WS_URL}?{urlencode(params)}"
-            websocket = await websockets.connect(url)
+            # 添加连接超时
+            websocket = await asyncio.wait_for(
+                websockets.connect(url),
+                timeout=self.config.connect_timeout
+            )
             logger.info("Xiling TTS WebSocket 连接成功 (access_token 鉴权)")
         
         return websocket
@@ -222,7 +235,7 @@ class HandlerTTSXiling(HandlerBase):
             logger.debug(f"Xiling TTS 发送 system.start: {start_payload}")
             
             # 等待 system.started
-            response = await asyncio.wait_for(websocket.recv(), timeout=10.0)
+            response = await asyncio.wait_for(websocket.recv(), timeout=self.config.init_timeout)
             if isinstance(response, str):
                 data = json.loads(response)
                 msg_type = data.get("type", "")
@@ -435,8 +448,8 @@ class HandlerTTSXiling(HandlerBase):
         streamer = context.data_submitter.get_streamer(ChatDataType.AVATAR_AUDIO)
         
         try:
-            # 设置超时
-            timeout = 30.0 if finish else 5.0
+            # 设置超时（根据配置）
+            timeout = self.config.audio_finish_timeout if finish else self.config.audio_timeout
             
             while True:
                 try:
