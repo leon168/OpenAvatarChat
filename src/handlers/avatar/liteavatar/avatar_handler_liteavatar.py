@@ -1,6 +1,7 @@
 from abc import ABC
 from typing import cast, Optional, Dict
 
+import librosa
 import numpy as np
 from loguru import logger
 import torch.multiprocessing as mp
@@ -144,13 +145,23 @@ class HandlerTts2Face(HandlerBase, ABC):
                 audio_array = (audio_array * 32767).astype(np.int16)
         else:
             audio_array = np.zeros([512], dtype=np.int16)
-        # logger.info(f's2v: {audio_array.shape} type {type(audio_array)}')
-        # logger.info(f'sample_rate {audio_entry.sample_rate}' )
+
+        # Resample to avatar's expected sample rate (24000Hz) if needed
+        # SpeechAudioProcessor assumes input at _init_option.audio_sample_rate
+        audio_sample_rate = audio_entry.sample_rate
+        target_sample_rate = 24000
+        if audio_sample_rate != target_sample_rate and audio_sample_rate > 0:
+            audio_float32 = audio_array.astype(np.float32) / 32767.0
+            resampled_float = librosa.resample(
+                audio_float32, orig_sr=audio_sample_rate, target_sr=target_sample_rate)
+            audio_array = (resampled_float * 32767.0).astype(np.int16)
+            audio_sample_rate = target_sample_rate
+
         speech_audio = SpeechAudio(
             speech_id=speech_id,
             end_of_speech=speech_end,
             audio_data=audio_array.tobytes(),
-            sample_rate=audio_entry.sample_rate,
+            sample_rate=audio_sample_rate,
         )
         context.lite_avatar_worker.audio_in_queue.put(speech_audio)
 
