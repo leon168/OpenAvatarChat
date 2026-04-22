@@ -50,7 +50,7 @@ class HandlerTts2FaceContext(HandlerContext):
 
         return self._playback_streamer
 
-def return_data(self, data, chat_data_type: ChatDataType):
+    def return_data(self, data, chat_data_type: ChatDataType):
         definition = self.output_data_definitions.get(chat_data_type)
         if definition is None:
             logger.warning(f"LiteAvatar return_data: no definition for {chat_data_type}, output_data_definitions keys={list(self.output_data_definitions.keys())}")
