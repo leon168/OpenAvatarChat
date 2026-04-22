@@ -637,14 +637,19 @@ class HandlerSRTOutput(HandlerBase):
         logger.info("[SYNC] SRT: ffmpeg session 启动完成")
         return session
 
-    def _start_ffmpeg_with_dual_tcp(self, config: SRTOutputConfig) -> SRTSession:
+    def _start_ffmpeg(self, config: SRTOutputConfig) -> SRTSession:
         """使用双 TCP 连接（视频 + 音频）启动 ffmpeg"""
+        session = SRTSession()
+        session.video_writer = None
+        session.audio_writer = None
+
         # 创建视频 TCP 服务器
         video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         video_sock.bind(('127.0.0.1', 0))
         _, video_port = video_sock.getsockname()
         video_sock.listen(1)
+        session._video_server_socket = video_sock
 
         # 创建音频 TCP 服务器
         audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -652,24 +657,7 @@ class HandlerSRTOutput(HandlerBase):
         audio_sock.bind(('127.0.0.1', 0))
         _, audio_port = audio_sock.getsockname()
         audio_sock.listen(1)
-
-        video_url = f"tcp://127.0.0.1:{video_port}"
-        audio_url = f"tcp://127.0.0.1:{audio_port}"
-        command = self._build_ffmpeg_command(config, video_url, audio_url)
-        logger.debug(f"Starting ffmpeg (Dual TCP): {' '.join(command)}")
-
-        process = subprocess.Popen(
-            command, stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
-        )
-        self._start_stderr_reader(process)
-
-        session = SRTSession()
-        session.ffmpeg_process = process
-        session._video_server_socket = video_sock
         session._audio_server_socket = audio_sock
-        session.video_writer = None
-        session.audio_writer = None
 
         # 等待两个连接，带超时处理
         connection_timeout = 15.0  # 秒
@@ -707,13 +695,21 @@ class HandlerSRTOutput(HandlerBase):
         threading.Thread(target=accept_video_connection, daemon=True, name="srt-video-accept").start()
         threading.Thread(target=accept_audio_connection, daemon=True, name="srt-audio-accept").start()
 
+        video_url = f"tcp://127.0.0.1:{video_port}"
+        audio_url = f"tcp://127.0.0.1:{audio_port}"
+        command = self._build_ffmpeg_command(config, video_url, audio_url)
+        logger.debug(f"Starting ffmpeg (Dual TCP): {' '.join(command)}")
+
+        process = subprocess.Popen(
+            command, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+        )
+        self._start_stderr_reader(process)
+        session.ffmpeg_process = process    
+        
         # 等待连接建立后再返回
         logger.info("SRT: 等待视频和音频 TCP 连接...")
         return session
-
-    def _start_ffmpeg(self, config: SRTOutputConfig) -> SRTSession:
-        # 统一使用双 TCP 方案
-        return self._start_ffmpeg_with_dual_tcp(config)
 
     def create_context(self, session_context: SessionContext,
                        handler_config: Optional[BaseModel] = None) -> HandlerContext:
