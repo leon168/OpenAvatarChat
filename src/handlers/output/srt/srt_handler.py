@@ -592,7 +592,9 @@ class HandlerSRTOutput(HandlerBase):
             raise
         
         # FIFO 就绪后再启动同步节奏器
+        logger.info("[SYNC] SRT: 启动同步节奏器...")
         self._start_sync_pacer(session, config)
+        logger.info("[SYNC] SRT: ffmpeg session 启动完成")
         return session
 
     def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
@@ -668,94 +670,102 @@ class HandlerSRTOutput(HandlerBase):
         )
 
     def _ensure_session(self, context: SRTOutputContext) -> Optional[SRTSession]:
-        logger.info(f"[SYNC] _ensure_session called: session={context.session}, is_running={context.session.is_running if context.session else 'N/A'}")
+        logger.info(f"[SYNC] ===== _ensure_session START ===== session={context.session}, fail_count={context._fail_count}")
         if context.session is not None and context.session.is_running:
-            logger.debug(f"[SYNC] _ensure_session: session={context.session}, frame_count={context.session.frame_count}")
+            logger.info(f"[SYNC] _ensure_session: 已有运行中的 session, frame_count={context.session.frame_count}")
             
             # 检查 ffmpeg 进程是否还在运行
             if context.session.ffmpeg_process is not None and context.session.ffmpeg_process.poll() is not None:
                 retcode = context.session.ffmpeg_process.poll()
-                logger.error(f"SRT: ffmpeg process crashed with code {retcode}, resetting session")
+                logger.error(f"[SYNC] _ensure_session: ffmpeg 进程已崩溃, retcode={retcode}")
                 self._record_failure(context)
                 context.session.reset()
                 context.session = None
-                return None
+                logger.info(f"[SYNC] _ensure_session: ffmpeg崩溃, 重置session")
             
-            # 如果已经有帧输出，说明 pacer 运行正常，跳过线程存活检查
-            if context.session.frame_count > 0:
-                # 运行正常，重置失败计数
+            # 如果已经有帧输出，说明 pacer 运行正常
+            elif context.session.frame_count > 0:
+                logger.info(f"[SYNC] _ensure_session: pacer运行正常, frame_count={context.session.frame_count}")
                 if context._fail_count > 0 and context.session.frame_count > 10:
                     logger.info("SRT: ffmpeg 运行正常，重置重试计数")
                     context._fail_count = 0
                 return context.session
             
-            # 只有在没有帧输出时才检查 pacer 线程状态
-            # 检查节奏器线程是否存活
-            if context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
+            # 检查 pacer 线程状态
+            elif context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
                 elapsed = time.time() - context.session._pacer_start_time if context.session._pacer_start_time > 0 else -1
-                logger.error(f"[SYNC] Pacer thread not alive! frame_count={context.session.frame_count}, elapsed={elapsed:.2f}s")
-                # 检查是否是因为等待音频连接而早期退出
+                logger.error(f"[SYNC] _ensure_session: Pacer线程已退出! elapsed={elapsed:.2f}s")
                 if context.session._pacer_start_time > 0:
                     elapsed = time.time() - context.session._pacer_start_time
-                    if elapsed < 10.0:  # 启动后10秒内退出，可能是音频连接问题
-                        logger.warning(f"SRT: Pacer exited early ({elapsed:.1f}s), attempting restart")
-                        # 不记录失败，直接重试
+                    if elapsed < 10.0:
+                        logger.warning(f"[SYNC] _ensure_session: Pacer提前退出({elapsed:.1f}s), 尝试重启")
                         context.session.reset()
                         context.session = None
                     else:
-                        logger.error("SRT: Sync pacer thread died unexpectedly")
+                        logger.error("[SYNC] _ensure_session: Pacer线程异常退出")
                         self._record_failure(context)
                         context.session.reset()
                         context.session = None
                 else:
-                    logger.error("SRT: Sync pacer thread died, resetting session")
+                    logger.error("[SYNC] _ensure_session: Pacer线程退出")
                     self._record_failure(context)
                     context.session.reset()
                     context.session = None
             
-            # 检查 pacer 是否正在启动中（避免竞态条件）
+            # 检查 pacer 启动中
             elif context.session._pacer_thread is not None and context.session._pacer_start_time > 0:
                 elapsed = time.time() - context.session._pacer_start_time
-                if elapsed < 5.0:  # 延长启动保护时间到5秒
-                    # 线程刚启动，还在初始化阶段，不要打扰
-                    logger.debug(f"SRT: Pacer thread starting up ({elapsed:.2f}s), skipping check")
+                logger.info(f"[SYNC] _ensure_session: Pacer正在启动({elapsed:.2f}s)")
+                if elapsed < 5.0:
                     return context.session
             
-            # 检查 pacer 是否卡死（线程活着但 frame_count=0 超过 35 秒）
+            # 检查 pacer 卡死
             elif context.session._pacer_start_time > 0:
                 stuck_duration = time.time() - context.session._pacer_start_time
+                logger.warning(f"[SYNC] _ensure_session: Pacer启动中, 已等待{stuck_duration:.1f}s")
                 if stuck_duration > 35.0:
-                    logger.error(f"SRT: Pacer stuck for {stuck_duration:.0f}s with 0 frames, resetting session")
+                    logger.error(f"[SYNC] _ensure_session: Pacer卡死超过35秒")
                     self._record_failure(context)
                     context.session.reset()
                     context.session = None
             
             else:
+                logger.info("[SYNC] _ensure_session: 已有session但pacer状态未知")
                 return context.session
 
-        # 重试冷却检查（指数退避：5, 10, 20, 40, 60s）
+        # 重试冷却检查
         if context._fail_count > 0:
             cooldown = min(5.0 * (2 ** min(context._fail_count - 1, 4)), 60.0)
             elapsed = time.time() - context._last_fail_time
             if elapsed < cooldown:
-                return None  # 冷却中，不重试
+                logger.warning(f"[SYNC] _ensure_session: 冷却中, 等待{cooldown-elapsed:.1f}s")
+                return None
+            logger.info(f"[SYNC] _ensure_session: 冷却结束, 已等待{elapsed:.1f}s")
 
+        # 重置旧session
         if context.session is not None:
+            logger.info("[SYNC] _ensure_session: 重置旧session")
             context.session.reset()
             context.session = None
 
-        if context._fail_count > 0:
-            logger.info(f"SRT: 重试启动 ffmpeg (第 {context._fail_count + 1} 次)")
+        logger.info(f"[SYNC] _ensure_session: 准备启动新ffmpeg, fail_count={context._fail_count}")
 
         try:
+            logger.info("[SYNC] _ensure_session: 调用 _start_ffmpeg...")
             session = self._start_ffmpeg(context.config)
+            logger.info(f"[SYNC] _ensure_session: _start_ffmpeg 返回 session={session}")
         except Exception as e:
-            logger.error(f"SRT Output: 启动 ffmpeg 失败: {e}")
+            logger.exception(f"[SYNC] _ensure_session: _start_ffmpeg 异常: {e}")
             self._record_failure(context)
             return None
 
+        if session is None:
+            logger.error("[SYNC] _ensure_session: _start_ffmpeg 返回 None!")
+            return None
+
         context.session = session
-        logger.info(f"SRT: ffmpeg session started, pid={session.ffmpeg_process.pid if session.ffmpeg_process else 'None'}")
+        logger.info(f"[SYNC] _ensure_session: ffmpeg启动成功, pid={session.ffmpeg_process.pid if session.ffmpeg_process else 'None'}")
+        logger.info(f"[SYNC] ===== _ensure_session END (SUCCESS) =====")
         return session
 
     def _record_failure(self, context: SRTOutputContext):
@@ -895,10 +905,13 @@ class HandlerSRTOutput(HandlerBase):
         input_stream = inputs.stream_id
         stream_key_str = str(input_stream.key) if input_stream and input_stream.key else "unknown"
 
+        logger.info("[SYNC] SRT: 调用 _ensure_session 获取 session...")
         session = self._ensure_session(context)
         if session is None:
-            logger.warning(f"[SYNC] SRT handle: _ensure_session returned None, type={inputs.type}")
+            logger.error(f"[SYNC] SRT handle: _ensure_session 返回 None! fail_count={context._fail_count}, type={inputs.type}")
             return
+        
+        logger.info(f"[SYNC] SRT handle: session 成功获取, frame_count={session.frame_count}")
 
         stream_id_str = f"{inputs.type.value}:{stream_key_str}"
         with session.state_lock:
@@ -906,16 +919,21 @@ class HandlerSRTOutput(HandlerBase):
                 session.active_streams.add(stream_id_str)
                 logger.info(f"[SYNC] SRT: 新流加入 {stream_id_str}")
 
+        logger.info(f"[SYNC] SRT: 准备写入数据, type={inputs.type}")
         if inputs.type == ChatDataType.AVATAR_VIDEO:
             video_frame = inputs.data.get_main_data()
+            logger.info(f"[SYNC] SRT: 写入视频帧, shape={video_frame.shape}")
             if not self._write_video(session, video_frame):
+                logger.error(f"[SYNC] SRT: _write_video 失败!")
                 self._record_failure(context)
                 session.reset()
                 context.session = None
 
         elif inputs.type == ChatDataType.AVATAR_AUDIO:
             audio_data = inputs.data.get_main_data()
+            logger.info(f"[SYNC] SRT: 写入音频, shape={audio_data.shape}")
             if not self._write_audio(session, audio_data):
+                logger.error(f"[SYNC] SRT: _write_audio 失败!")
                 self._record_failure(context)
                 session.reset()
                 context.session = None
@@ -927,6 +945,8 @@ class HandlerSRTOutput(HandlerBase):
                 if not remaining:
                     session.reset()
                     context.session = None
+        
+        logger.info(f"[SYNC] SRT handle 完成, type={inputs.type}")
 
     def on_signal(self, context: HandlerContext, signal: ChatSignal):
         context = cast(SRTOutputContext, context)
