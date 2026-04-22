@@ -20,7 +20,6 @@ import tempfile
 import threading
 import time
 import numpy as np
-import fcntl
 import cv2
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, cast
@@ -579,14 +578,11 @@ class HandlerSRTOutput(HandlerBase):
         session.tmp_dir = tmp_dir
 
         # 先打开 FIFO，再启动 pacer（确保 FIFO 在 pacer 启动前就绪）
-        # 注意：FIFO需要reader和writer同时在线才能正常工作
-        # ffmpeg会阻塞等待reader，我们用O_NONBLOCK避免死锁
+        # 正确顺序：先启动 ffmpeg (reader，等待中)，再打开 writer
         try:
             logger.info("[SYNC] _start_ffmpeg_with_fifo: 打开FIFO...")
-            fd = os.open(audio_fifo, os.O_WRONLY | os.O_NONBLOCK)
-            # 切换回阻塞模式以便正常写入
-            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+            # ffmpeg 已经作为 reader 在等待，现在打开 writer
+            fd = os.open(audio_fifo, os.O_WRONLY)
             logger.info(f"[SYNC] _start_ffmpeg_with_fifo: FIFO打开成功, fd={fd}")
             with session.state_lock:
                 session.audio_writer = fd
