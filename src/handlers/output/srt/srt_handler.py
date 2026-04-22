@@ -13,10 +13,8 @@ SRT 推流输出 Handler
 
 import os
 import platform
-import queue
 import socket
 import subprocess
-import tempfile
 import threading
 import time
 import numpy as np
@@ -40,8 +38,6 @@ from chat_engine.data_models.chat_stream import StreamKey, ChatStreamIdentity
 from chat_engine.data_models.chat_stream_config import ChatStreamConfig
 from chat_engine.data_models.runtime_data.data_bundle import DataBundle, DataBundleDefinition, DataBundleEntry
 
-IS_WINDOWS = platform.system() == 'Windows'
-
 
 class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     """SRT 输出配置"""
@@ -61,12 +57,15 @@ class SRTOutputConfig(HandlerBaseConfigModel, BaseModel):
     ffmpeg_path: str = Field(default="ffmpeg", description="ffmpeg 可执行文件路径")
     srt_url_env: str = Field(default="SRT_URL", description="SRT URL 环境变量名")
     video_queue_size: int = Field(default=5, description="视频帧队列大小(帧数)")
+    stream_start_timeout_ms: int = Field(default=5000, description="等待音视频都到达的超时时间(毫秒)")
+    video_missing_color: str = Field(default="#000000", description="视频缺失时的背景颜色(hex)")
 
 
 @dataclass
 class SRTSession:
     """SRT 会话状态"""
     ffmpeg_process: Optional[subprocess.Popen] = None
+    video_writer: Optional[object] = None
     audio_writer: Optional[object] = None
     audio_fifo_path: Optional[str] = None
     tmp_dir: Optional[str] = None
@@ -76,8 +75,12 @@ class SRTSession:
     state_lock: threading.Lock = field(default_factory=threading.Lock)
     # 音频写入锁：防止并发 TCP/FIFO 写入导致数据交错
     audio_write_lock: threading.Lock = field(default_factory=threading.Lock)
+    # 视频写入锁
+    video_write_lock: threading.Lock = field(default_factory=threading.Lock)
     active_streams: Set[str] = field(default_factory=set)
+    _video_server_socket: Optional[socket.socket] = None
     _audio_server_socket: Optional[socket.socket] = None
+    _video_ready: threading.Event = field(default_factory=threading.Event)
     _audio_ready: threading.Event = field(default_factory=threading.Event)
     # 视频帧队列（由同步节奏器消费）
     _video_queue: "deque" = field(default_factory=deque)
@@ -94,8 +97,12 @@ class SRTSession:
     _last_video_bytes: Optional[bytes] = None
     # pacer 启动时间（用于检测卡死）
     _pacer_start_time: float = 0.0
-    # 启动前的音频缓冲（TCP/FIFO 未连接时暂存）
+# 启动前的音频缓冲（TCP/FIFO 未连接时暂存）
     _pre_connect_audio_buffer: list = field(default_factory=list)
+    # 启动同步状态
+    _first_video_received: bool = False
+    _first_audio_received: bool = False
+    _stream_start_time: float = 0.0
 
     def reset(self):
         """重置会话"""
@@ -112,9 +119,27 @@ class SRTSession:
             self._pacer_thread = None
 
         with self.state_lock:
+            self._video_ready.clear()
             self._audio_ready.clear()
             self._pre_connect_audio_buffer.clear()
 
+            # 关闭视频连接
+            if self.video_writer is not None:
+                try:
+                    if isinstance(self.video_writer, socket.socket):
+                        self.video_writer.close()
+                except Exception:
+                    pass
+                self.video_writer = None
+
+            if self._video_server_socket is not None:
+                try:
+                    self._video_server_socket.close()
+                except Exception:
+                    pass
+                self._video_server_socket = None
+
+            # 关闭音频连接
             if self.audio_writer is not None:
                 try:
                     if isinstance(self.audio_writer, socket.socket):
@@ -217,7 +242,8 @@ class HandlerSRTOutput(HandlerBase):
             srt_url = f"{srt_url}&latency={config.latency_ms * 1000}"
         return srt_url
 
-    def _build_ffmpeg_command(self, config: SRTOutputConfig, audio_input: str) -> list:
+    def _build_ffmpeg_command(self, config: SRTOutputConfig, video_input: str, audio_input: str) -> list:
+        """构建 ffmpeg 命令，使用双 TCP 输入"""
         srt_url = self._build_srt_url(config)
         return [
             config.ffmpeg_path,
@@ -226,7 +252,7 @@ class HandlerSRTOutput(HandlerBase):
             "-s", f"{config.video_width}x{config.video_height}",
             "-r", str(config.fps),
             "-thread_queue_size", "512",
-            "-i", "-",
+            "-i", video_input,
             "-f", "f32le", "-ar", str(config.audio_sample_rate), "-ac", "1",
             "-thread_queue_size", "512",
             "-i", audio_input,
@@ -611,16 +637,26 @@ class HandlerSRTOutput(HandlerBase):
         logger.info("[SYNC] SRT: ffmpeg session 启动完成")
         return session
 
-    def _start_ffmpeg_with_tcp(self, config: SRTOutputConfig) -> SRTSession:
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(('127.0.0.1', 0))
-        _, audio_port = server_sock.getsockname()
-        server_sock.listen(1)
+    def _start_ffmpeg_with_dual_tcp(self, config: SRTOutputConfig) -> SRTSession:
+        """使用双 TCP 连接（视频 + 音频）启动 ffmpeg"""
+        # 创建视频 TCP 服务器
+        video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        video_sock.bind(('127.0.0.1', 0))
+        _, video_port = video_sock.getsockname()
+        video_sock.listen(1)
 
+        # 创建音频 TCP 服务器
+        audio_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        audio_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        audio_sock.bind(('127.0.0.1', 0))
+        _, audio_port = audio_sock.getsockname()
+        audio_sock.listen(1)
+
+        video_url = f"tcp://127.0.0.1:{video_port}"
         audio_url = f"tcp://127.0.0.1:{audio_port}"
-        command = self._build_ffmpeg_command(config, audio_url)
-        logger.debug(f"Starting ffmpeg (TCP): {' '.join(command)}")
+        command = self._build_ffmpeg_command(config, video_url, audio_url)
+        logger.debug(f"Starting ffmpeg (Dual TCP): {' '.join(command)}")
 
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE,
@@ -630,38 +666,54 @@ class HandlerSRTOutput(HandlerBase):
 
         session = SRTSession()
         session.ffmpeg_process = process
-        session._audio_server_socket = server_sock
+        session._video_server_socket = video_sock
+        session._audio_server_socket = audio_sock
+        session.video_writer = None
+        session.audio_writer = None
 
-        # 启动同步节奏器
-        self._start_sync_pacer(session, config)
+        # 等待两个连接，带超时处理
+        connection_timeout = 15.0  # 秒
+
+        def accept_video_connection():
+            try:
+                video_sock.settimeout(connection_timeout)
+                conn, _ = video_sock.accept()
+                with session.state_lock:
+                    session.video_writer = conn
+                logger.info(f"SRT: 视频 TCP 连接已建立 (port={video_port})")
+                session._video_ready.set()
+            except Exception as e:
+                logger.error(f"SRT: 等待视频 TCP 连接失败: {e}")
+                session._video_ready.set()
 
         def accept_audio_connection():
             try:
-                server_sock.settimeout(15)
-                conn, _ = server_sock.accept()
+                audio_sock.settimeout(connection_timeout)
+                conn, _ = audio_sock.accept()
                 with session.state_lock:
                     session.audio_writer = conn
-                    dropped_chunks = len(session._pre_connect_audio_buffer)
-                    dropped_bytes = sum(len(b) for b in session._pre_connect_audio_buffer)
-                    session._pre_connect_audio_buffer.clear()
-                if dropped_chunks > 0:
-                    logger.info(f"[SYNC] SRT: 音频 TCP 连接已建立，丢弃 {dropped_chunks} 块旧缓冲 "
-                               f"({dropped_bytes} bytes)")
-                else:
-                    logger.info("SRT: 音频 TCP 连接已建立")
+                logger.info(f"SRT: 音频 TCP 连接已建立 (port={audio_port})")
                 session._audio_ready.set()
             except Exception as e:
                 logger.error(f"SRT: 等待音频 TCP 连接失败: {e}")
                 session._audio_ready.set()
 
-        threading.Thread(target=accept_audio_connection, daemon=True).start()
+        # 设置事件
+        session._video_ready = threading.Event()
+        session._audio_ready = threading.Event()
+        session._video_ready.clear()
+        session._audio_ready.clear()
+
+        threading.Thread(target=accept_video_connection, daemon=True, name="srt-video-accept").start()
+        threading.Thread(target=accept_audio_connection, daemon=True, name="srt-audio-accept").start()
+
+        # 等待连接建立后再返回
+        logger.info("SRT: 等待视频和音频 TCP 连接...")
         return session
 
     def _start_ffmpeg(self, config: SRTOutputConfig) -> SRTSession:
-        if IS_WINDOWS:
-            return self._start_ffmpeg_with_tcp(config)
-        else:
-            return self._start_ffmpeg_with_fifo(config)
+        # 统一使用双 TCP 方案
+        return self._start_ffmpeg_with_dual_tcp(config)
 
     def create_context(self, session_context: SessionContext,
                        handler_config: Optional[BaseModel] = None) -> HandlerContext:
@@ -687,7 +739,7 @@ class HandlerSRTOutput(HandlerBase):
         logger.info(f"[SYNC] ===== _ensure_session START ===== session={context.session}, fail_count={context._fail_count}")
         if context.session is not None and context.session.is_running:
             logger.info(f"[SYNC] _ensure_session: 已有运行中的 session, frame_count={context.session.frame_count}")
-            
+
             # 检查 ffmpeg 进程是否还在运行
             if context.session.ffmpeg_process is not None and context.session.ffmpeg_process.poll() is not None:
                 retcode = context.session.ffmpeg_process.poll()
@@ -696,55 +748,23 @@ class HandlerSRTOutput(HandlerBase):
                 context.session.reset()
                 context.session = None
                 logger.info(f"[SYNC] _ensure_session: ffmpeg崩溃, 重置session")
-            
-            # 如果已经有帧输出，说明 pacer 运行正常
+
+            # 如果已经有帧输出，说明正常运行
             elif context.session.frame_count > 0:
-                logger.info(f"[SYNC] _ensure_session: pacer运行正常, frame_count={context.session.frame_count}")
+                logger.info(f"[SYNC] _ensure_session: 运行正常, frame_count={context.session.frame_count}")
                 if context._fail_count > 0 and context.session.frame_count > 10:
                     logger.info("SRT: ffmpeg 运行正常，重置重试计数")
                     context._fail_count = 0
                 return context.session
-            
-            # 检查 pacer 线程状态
-            elif context.session._pacer_thread is not None and not context.session._pacer_thread.is_alive():
-                elapsed = time.time() - context.session._pacer_start_time if context.session._pacer_start_time > 0 else -1
-                logger.error(f"[SYNC] _ensure_session: Pacer线程已退出! elapsed={elapsed:.2f}s")
-                if context.session._pacer_start_time > 0:
-                    elapsed = time.time() - context.session._pacer_start_time
-                    if elapsed < 10.0:
-                        logger.warning(f"[SYNC] _ensure_session: Pacer提前退出({elapsed:.1f}s), 尝试重启")
-                        context.session.reset()
-                        context.session = None
-                    else:
-                        logger.error("[SYNC] _ensure_session: Pacer线程异常退出")
-                        self._record_failure(context)
-                        context.session.reset()
-                        context.session = None
-                else:
-                    logger.error("[SYNC] _ensure_session: Pacer线程退出")
-                    self._record_failure(context)
-                    context.session.reset()
-                    context.session = None
-            
-            # 检查 pacer 启动中
-            elif context.session._pacer_thread is not None and context.session._pacer_start_time > 0:
-                elapsed = time.time() - context.session._pacer_start_time
-                logger.info(f"[SYNC] _ensure_session: Pacer正在启动({elapsed:.2f}s)")
-                if elapsed < 5.0:
-                    return context.session
-            
-            # 检查 pacer 卡死
-            elif context.session._pacer_start_time > 0:
-                stuck_duration = time.time() - context.session._pacer_start_time
-                logger.warning(f"[SYNC] _ensure_session: Pacer启动中, 已等待{stuck_duration:.1f}s")
-                if stuck_duration > 35.0:
-                    logger.error(f"[SYNC] _ensure_session: Pacer卡死超过35秒")
-                    self._record_failure(context)
-                    context.session.reset()
-                    context.session = None
-            
+
+            # 检查 TCP 连接是否有效
+            elif context.session.video_writer is None or context.session.audio_writer is None:
+                logger.warning("[SYNC] _ensure_session: TCP 连接未建立")
+                context.session.reset()
+                context.session = None
+
             else:
-                logger.info("[SYNC] _ensure_session: 已有session但pacer状态未知")
+                logger.info("[SYNC] _ensure_session: 已有 session")
                 return context.session
 
         # 重试冷却检查
@@ -779,6 +799,31 @@ class HandlerSRTOutput(HandlerBase):
 
         context.session = session
         logger.info(f"[SYNC] _ensure_session: ffmpeg启动成功, pid={session.ffmpeg_process.pid if session.ffmpeg_process else 'None'}")
+
+        # 等待两个 TCP 连接都建立，带超时
+        logger.info("[SYNC] _ensure_session: 等待视频和音频 TCP 连接...")
+        wait_timeout = 10.0  # 最多等待 10 秒
+        start_wait = time.time()
+        while time.time() - start_wait < wait_timeout:
+            video_ready = session._video_ready.is_set() or session.video_writer is not None
+            audio_ready = session._audio_ready.is_set() or session.audio_writer is not None
+
+            if video_ready and audio_ready:
+                logger.info("[SYNC] _ensure_session: 视频和音频 TCP 都已连接")
+                break
+
+            # 检查 ffmpeg 是否崩溃
+            if session.ffmpeg_process.poll() is not None:
+                logger.error("[SYNC] _ensure_session: ffmpeg 在等待连接时退出")
+                return None
+
+            time.sleep(0.1)
+
+        if session.video_writer is None:
+            logger.warning("[SYNC] _ensure_session: 视频 TCP 连接超时")
+        if session.audio_writer is None:
+            logger.warning("[SYNC] _ensure_session: 音频 TCP 连接超时")
+
         logger.info(f"[SYNC] ===== _ensure_session END (SUCCESS) =====")
         return session
 
@@ -829,8 +874,45 @@ class HandlerSRTOutput(HandlerBase):
 
         return video_frame.tobytes()
 
+    def _check_stream_start(self, session: SRTSession) -> bool:
+        """检查是否需要等待两个流都到达
+
+        Returns:
+            True: 可以开始发送
+            False: 需要等待
+        """
+        with session.state_lock:
+            # 首次调用时记录开始时间
+            if session._stream_start_time == 0.0:
+                session._stream_start_time = time.time()
+
+            timeout_ms = self.config.stream_start_timeout_ms if self.config else 5000
+            elapsed = (time.time() - session._stream_start_time) * 1000
+
+            if session._first_video_received and session._first_audio_received:
+                return True
+
+            if elapsed > timeout_ms:
+                # 超时，一个到了另一个没到
+                if not session._first_video_received:
+                    logger.warning(f"SRT: 视频流超时({elapsed:.0f}ms), 将使用背景色")
+                    session._first_video_received = True
+                if not session._first_audio_received:
+                    logger.warning(f"SRT: 音频流超时({elapsed:.0f}ms), 将使用静音")
+                    session._first_audio_received = True
+                return True
+
+            # 计算剩余等待时间
+            remaining = timeout_ms - elapsed
+            if remaining > 0:
+                logger.info(f"SRT: 等待音视频到达... video={session._first_video_received}, "
+                           f"audio={session._first_audio_received}, 剩余{remaining:.0f}ms")
+                return False
+
+        return True
+
     def _write_video(self, session: SRTSession, video_frame: np.ndarray):
-        """将视频帧放入队列，由同步节奏器线程消费"""
+        """直接发送视频帧到 TCP 连接"""
         if not session.is_running:
             return False
 
@@ -838,29 +920,35 @@ class HandlerSRTOutput(HandlerBase):
             return True
 
         try:
+            # 检查启动同步状态
+            if not session._first_video_received:
+                session._first_video_received = True
+                if not self._check_stream_start(session):
+                    logger.info("SRT: 等待音频流到达，暂不发送视频")
+                    return True
+
             rgb_bytes = self._prepare_video_frame(video_frame)
 
-            with session._video_queue_lock:
-                # 限制队列长度，超出则丢弃最旧的帧
-                max_size = self.config.video_queue_size if self.config else 30
-                q_len = len(session._video_queue)
-                while q_len >= max_size:
-                    session._video_queue.popleft()
-                    q_len -= 1
-                session._video_queue.append(rgb_bytes)
-                q_len += 1
+            # 直接发送到 TCP
+            with session.state_lock:
+                writer = session.video_writer
 
-            if session.frame_count == 0 and q_len <= 3:
-                logger.info(f"[SYNC] SRT: Video frame queued ({len(rgb_bytes)} bytes, queue={q_len})")
+            if writer is None:
+                logger.warning("SRT: 视频 TCP 未连接，跳过帧")
+                return True
 
+            with session.video_write_lock:
+                writer.sendall(rgb_bytes)
+
+            session.frame_count += 1
             return True
 
         except Exception as e:
-            logger.error(f"SRT: Failed to queue video frame: {e}")
+            logger.error(f"SRT: 发送视频帧失败: {e}")
             return False
 
     def _write_audio(self, session: SRTSession, audio_data: np.ndarray):
-        """将音频数据追加到缓冲区，由同步节奏器线程消费"""
+        """直接发送音频数据到 TCP 连接"""
         if not session.is_running:
             return False
 
@@ -878,36 +966,31 @@ class HandlerSRTOutput(HandlerBase):
                 if max_val > 1.0:
                     audio_data = audio_data / max_val
 
+            # 检查启动同步状态
+            if not session._first_audio_received:
+                session._first_audio_received = True
+                if not self._check_stream_start(session):
+                    logger.info("SRT: 等待视频流到达，暂不发送音频")
+                    return True
+
             audio_bytes = audio_data.tobytes()
 
-            with session._audio_buffer_lock:
-                # 限制缓冲区大小（最多 5 秒）
-                max_bytes = self.config.audio_sample_rate * 4 * 5 if self.config else 24000 * 4 * 5
-                if len(session._audio_buffer) + len(audio_bytes) > max_bytes:
-                    # 丢弃最旧的数据
-                    excess = len(session._audio_buffer) + len(audio_bytes) - max_bytes
-                    del session._audio_buffer[:excess]
-                session._audio_buffer.extend(audio_bytes)
-
-            session._audio_buffer_event.set()
-
-            # 首次音频写入日志
-            with session._audio_buffer_lock:
-                buf_samples = len(session._audio_buffer) // 4
-            if session.audio_sample_count == 0 and buf_samples <= 2880:  # 只前3帧
-                logger.info(f"[SYNC] SRT: Audio buffered, {len(audio_data)} samples, "
-                           f"total buffer={buf_samples} samples")
-
-            # 如果 TCP/FIFO 还没连接，也暂存一份到 pre_connect buffer
+            # 直接发送到 TCP
             with session.state_lock:
-                if session.audio_writer is None:
-                    if len(session._pre_connect_audio_buffer) < 100:
-                        session._pre_connect_audio_buffer.append(audio_bytes)
+                writer = session.audio_writer
 
+            if writer is None:
+                logger.warning("SRT: 音频 TCP 未连接，跳过")
+                return True
+
+            with session.audio_write_lock:
+                writer.sendall(audio_bytes)
+
+            session.audio_sample_count += len(audio_data)
             return True
 
         except Exception as e:
-            logger.error(f"SRT: 写入音频数据失败: {e}")
+            logger.error(f"SRT: 发送音频失败: {e}")
             return False
 
     def handle(self, context: HandlerContext, inputs: ChatData,
