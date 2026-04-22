@@ -888,6 +888,7 @@ class HandlerSRTOutput(HandlerBase):
 
     def handle(self, context: HandlerContext, inputs: ChatData,
                output_definitions: Dict[ChatDataType, HandlerDataInfo]):
+        logger.info(f"[SYNC] SRT handle() called: type={inputs.type}, stream_id={inputs.stream_id}")
         context = cast(SRTOutputContext, context)
 
         input_stream = inputs.stream_id
@@ -895,6 +896,7 @@ class HandlerSRTOutput(HandlerBase):
 
         session = self._ensure_session(context)
         if session is None:
+            logger.warning(f"[SYNC] SRT handle: _ensure_session returned None, type={inputs.type}")
             return
 
         stream_id_str = f"{inputs.type.value}:{stream_key_str}"
