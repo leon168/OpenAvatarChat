@@ -47,9 +47,10 @@ class HandlerTts2FaceContext(HandlerContext):
                 producer_name="LiteAvatar",
                 config=ChatStreamConfig(cancelable=False),
             )
+
         return self._playback_streamer
 
-def return_data(self, data, chat_data_type: ChatDataType):
+    def return_data(self, data, chat_data_type: ChatDataType):
         # DEBUG: Log every return_data call
         logger.info(f"LiteAvatar return_data: type={chat_data_type}, data_shape={data.shape if hasattr(data, 'shape') else 'N/A'}")
         
