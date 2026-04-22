@@ -1094,7 +1094,7 @@ class ChatDataSubmitter:
     def get_streamer_by_name(self, name: str):
         return self.streamer_name_map.get(name, None)
 
-def submit(self, data: Union[StreamableData, Tuple[ChatDataType, StreamableData]],
+    def submit(self, data: Union[StreamableData, Tuple[ChatDataType, StreamableData]],
                finish_stream: Optional[bool] = None):
         if data is None:
             return
