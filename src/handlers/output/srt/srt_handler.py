@@ -20,6 +20,8 @@ import tempfile
 import threading
 import time
 import numpy as np
+import fcntl
+import cv2
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Set, cast
 from collections import deque
@@ -577,9 +579,14 @@ class HandlerSRTOutput(HandlerBase):
         session.tmp_dir = tmp_dir
 
         # 先打开 FIFO，再启动 pacer（确保 FIFO 在 pacer 启动前就绪）
+        # 注意：FIFO需要reader和writer同时在线才能正常工作
+        # ffmpeg会阻塞等待reader，我们用O_NONBLOCK避免死锁
         try:
             logger.info("[SYNC] _start_ffmpeg_with_fifo: 打开FIFO...")
-            fd = os.open(audio_fifo, os.O_WRONLY)
+            fd = os.open(audio_fifo, os.O_WRONLY | os.O_NONBLOCK)
+            # 切换回阻塞模式以便正常写入
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
             logger.info(f"[SYNC] _start_ffmpeg_with_fifo: FIFO打开成功, fd={fd}")
             with session.state_lock:
                 session.audio_writer = fd
@@ -820,7 +827,6 @@ class HandlerSRTOutput(HandlerBase):
         target_height = self.config.video_height if self.config.video_height > 0 else 512
 
         if video_frame.shape[0] != target_height or video_frame.shape[1] != target_width:
-            import cv2
             video_frame = cv2.resize(video_frame, (target_width, target_height))
             if not HandlerSRTOutput._video_frame_logged:
                 logger.info(f"SRT: Resized to {video_frame.shape}")
