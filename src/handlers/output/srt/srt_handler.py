@@ -668,6 +668,7 @@ class HandlerSRTOutput(HandlerBase):
         )
 
     def _ensure_session(self, context: SRTOutputContext) -> Optional[SRTSession]:
+        logger.info(f"[SYNC] _ensure_session called: session={context.session}, is_running={context.session.is_running if context.session else 'N/A'}")
         if context.session is not None and context.session.is_running:
             logger.debug(f"[SYNC] _ensure_session: session={context.session}, frame_count={context.session.frame_count}")
             
