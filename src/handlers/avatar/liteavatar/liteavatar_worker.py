@@ -275,8 +275,6 @@ class LiteAvatarWorker:
                     self.processor.start()
                     self.audio_input_thread = threading.Thread(target=self._audio_input_loop)
                     self.audio_input_thread.start()
-                    # 启动输出处理线程，从队列读取数据并提交到数据流引擎
-                    self._start_output_process_thread()
                     logger.info("Avatar session started")
                 else:
                     logger.warning("Received START event but session is already active, ignoring")
@@ -292,8 +290,6 @@ class LiteAvatarWorker:
                     if self.audio_input_thread is not None:
                         self.audio_input_thread.join()
                         self.audio_input_thread = None
-                    # 停止输出处理线程
-                    self._stop_output_process_thread()
                     self._clear_mp_queues()
                     self.context = None
                     logger.info("Avatar session stopped")

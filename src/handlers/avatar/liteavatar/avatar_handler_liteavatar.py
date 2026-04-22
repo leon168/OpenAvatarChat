@@ -97,12 +97,11 @@ class HandlerTts2Face(HandlerBase, ABC):
             ChatDataType.AVATAR_AUDIO: HandlerDataInfo(
                 type=ChatDataType.AVATAR_AUDIO,
                 definition=context.output_data_definitions[ChatDataType.AVATAR_AUDIO],
-                output_stream_config=ChatStreamConfig(cancelable=False, auto_link_input=False),
             ),
             ChatDataType.AVATAR_VIDEO: HandlerDataInfo(
                 type=ChatDataType.AVATAR_VIDEO,
                 definition=context.output_data_definitions[ChatDataType.AVATAR_VIDEO],
-                output_stream_config=ChatStreamConfig(cancelable=False, auto_link_input=False),
+                output_stream_config=ChatStreamConfig(cancelable=False, auto_link_input=True),
             ),
         }
         return HandlerDetail(
