@@ -23,6 +23,7 @@ class CommonModuleContext(object):
         if self.data_submitter is None:
             logger.error("Session is not started, data submitter not ready.")
             return
+        logger.debug(f"CommonModuleContext.submit_data: type={data.type if hasattr(data, 'type') else 'unknown'}")
         self.data_submitter.submit(data, finish_stream=finish_stream)
 
     def emit_signal(self, signal: ChatSignal):

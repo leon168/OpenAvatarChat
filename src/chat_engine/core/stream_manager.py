@@ -801,9 +801,11 @@ class ChatStreamer:
             stream.update_metadata(stream_meta)
         sinks = self._data_sinks.get(self._data_type, [])
         if len(sinks) == 0:
+            logger.warning(f"ChatStreamer.stream_data: no sinks for data_type={self._data_type}")
             if finish_stream:
                 self.finish_current()  # Still need to finish the stream even without sinks
             return
+        logger.debug(f"ChatStreamer.stream_data: data_type={self._data_type}, sinks_count={len(sinks)}")
         chat_data = self._packet_chat_data(data)
         if isinstance(finish_stream, bool):
             chat_data.is_last_data = finish_stream
@@ -1092,7 +1094,7 @@ class ChatDataSubmitter:
     def get_streamer_by_name(self, name: str):
         return self.streamer_name_map.get(name, None)
 
-    def submit(self, data: Union[StreamableData, Tuple[ChatDataType, StreamableData]],
+def submit(self, data: Union[StreamableData, Tuple[ChatDataType, StreamableData]],
                finish_stream: Optional[bool] = None):
         if data is None:
             return
@@ -1124,7 +1126,8 @@ class ChatDataSubmitter:
             msg = f"Unsupported chat data with type {type(data)}"
             raise ValueError(msg)
         if streamers is None or len(streamers) == 0:
-            logger.warning(f"No streamer for data type {data_type}")
+            logger.warning(f"No streamer for data type {data_type}, streamers keys={list(self.streamers.keys())}")
             return
+        logger.debug(f"ChatDataSubmitter.submit: data_type={data_type}, num_streamers={len(streamers)}")
         for streamer in streamers:
             streamer.stream_data(stream_data, finish_stream=finish_stream)
