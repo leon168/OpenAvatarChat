@@ -1102,7 +1102,7 @@ class ChatDataSubmitter:
         if len(self.streamers) == 1:
             data_type = list(self.streamers.keys())[0]
             streamers = self.get_streamers(data_type)
-        if isinstance(data, ChatData):
+        elif isinstance(data, ChatData):
             data_type = data.type
             streamers = self.get_streamers(data_type)
         elif isinstance(data, (DataBundle, np.ndarray)):
@@ -1125,6 +1125,8 @@ class ChatDataSubmitter:
             raise ValueError(msg)
         if streamers is None or len(streamers) == 0:
             logger.warning(f"No streamer for data type {data_type}")
+            # DEBUG: Log all registered streamers to help diagnose
+            logger.warning(f"Registered streamers: {list(self.streamers.keys())}")
             return
         for streamer in streamers:
             streamer.stream_data(stream_data, finish_stream=finish_stream)

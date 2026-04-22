@@ -893,6 +893,9 @@ class HandlerSRTOutput(HandlerBase):
         input_stream = inputs.stream_id
         stream_key_str = str(input_stream.key) if input_stream and input_stream.key else "unknown"
 
+        # DEBUG: Log every handle() call to verify data flow
+        logger.info(f"[SYNC] SRT handle() called: type={inputs.type}, stream_key={stream_key_str}, is_last={inputs.is_last_data}")
+
         session = self._ensure_session(context)
         if session is None:
             return
