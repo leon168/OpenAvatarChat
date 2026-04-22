@@ -51,12 +51,8 @@ class HandlerTts2FaceContext(HandlerContext):
         return self._playback_streamer
 
     def return_data(self, data, chat_data_type: ChatDataType):
-        # DEBUG: Log every return_data call
-        logger.info(f"LiteAvatar return_data: type={chat_data_type}, data_shape={data.shape if hasattr(data, 'shape') else 'N/A'}")
-        
         definition = self.output_data_definitions.get(chat_data_type)
         if definition is None:
-            logger.warning(f"LiteAvatar return_data: no definition for {chat_data_type}")
             return
         data_bundle = DataBundle(definition)
         if chat_data_type.channel_type == EngineChannelType.AUDIO:
