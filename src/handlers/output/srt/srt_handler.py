@@ -274,6 +274,7 @@ class HandlerSRTOutput(HandlerBase):
         确保 ffmpeg 的两个 raw 输入 demuxer 线程同步推进 PTS，
         从根本上消除音视频漂移问题。
         """
+        logger.info("[SYNC] ===== _start_sync_pacer START =====")
         session._pacer_quit.clear()
         fps = config.fps
         sample_rate = config.audio_sample_rate
@@ -285,6 +286,7 @@ class HandlerSRTOutput(HandlerBase):
         audio_bytes_per_frame = samples_per_frame * 4
 
         def pacer_loop():
+            logger.info("[SYNC] ===== pacer_loop START =====")
             # FIFO 已经在启动前打开，只需等待音频缓冲积累足够数据
             # 必须等缓冲足够后才开始写数据，否则音频缓冲会快速耗尽
             buffer_wait_start = time.time()
@@ -550,19 +552,23 @@ class HandlerSRTOutput(HandlerBase):
         session._pacer_start_time = time.time()
         thread.start()
         session._pacer_thread = thread
+        logger.info(f"[SYNC] _start_sync_pacer: 线程已启动, thread_id={thread.ident}")
 
     def _start_ffmpeg_with_fifo(self, config: SRTOutputConfig) -> SRTSession:
+        logger.info("[SYNC] _start_ffmpeg_with_fifo: 开始创建临时目录...")
         tmp_dir = tempfile.mkdtemp(prefix='srt_')
         audio_fifo = os.path.join(tmp_dir, 'audio')
         os.mkfifo(audio_fifo)
+        logger.info(f"[SYNC] _start_ffmpeg_with_fifo: FIFO路径={audio_fifo}")
 
         command = self._build_ffmpeg_command(config, audio_fifo)
-        logger.debug(f"Starting ffmpeg (FIFO): {' '.join(command)}")
+        logger.info(f"[SYNC] _start_ffmpeg_with_fifo: 启动ffmpeg命令")
 
         process = subprocess.Popen(
             command, stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
         )
+        logger.info(f"[SYNC] _start_ffmpeg_with_fifo: ffmpeg进程启动, pid={process.pid}")
         self._start_stderr_reader(process)
 
         session = SRTSession()
@@ -572,7 +578,9 @@ class HandlerSRTOutput(HandlerBase):
 
         # 先打开 FIFO，再启动 pacer（确保 FIFO 在 pacer 启动前就绪）
         try:
+            logger.info("[SYNC] _start_ffmpeg_with_fifo: 打开FIFO...")
             fd = os.open(audio_fifo, os.O_WRONLY)
+            logger.info(f"[SYNC] _start_ffmpeg_with_fifo: FIFO打开成功, fd={fd}")
             with session.state_lock:
                 session.audio_writer = fd
             logger.info("SRT: 音频 FIFO 已打开")
@@ -586,14 +594,17 @@ class HandlerSRTOutput(HandlerBase):
                     logger.info(f"[SYNC] SRT: 合并预连接缓冲 {merged_bytes} bytes")
             
             session._audio_ready.set()
+            logger.info("[SYNC] _start_ffmpeg_with_fifo: audio_ready设置完成")
         except Exception as e:
-            logger.error(f"SRT: 打开音频 FIFO 失败: {e}")
+            logger.exception(f"[SYNC] _start_ffmpeg_with_fifo: 打开FIFO失败: {e}")
             session._audio_ready.set()
             raise
         
         # FIFO 就绪后再启动同步节奏器
-        logger.info("[SYNC] SRT: 启动同步节奏器...")
+        logger.info("[SYNC] _start_ffmpeg_with_fifo: 调用 _start_sync_pacer...")
         self._start_sync_pacer(session, config)
+        logger.info("[SYNC] _start_ffmpeg_with_fifo: _start_sync_pacer返回")
+        
         logger.info("[SYNC] SRT: ffmpeg session 启动完成")
         return session
 
